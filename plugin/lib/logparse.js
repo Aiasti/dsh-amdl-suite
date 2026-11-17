@@ -13,7 +13,7 @@ export function parseLine(line) {
   if (m) {
     return { kind: m[1] === 'Downloading' ? 'download' : 'decrypt', percent: Number(m[2]) }
   }
-  if (s === 'Decrypted' || s.includes('Audio integrity intact')) return { kind: 'done' }
+  if (s.includes('Decrypted') || s.includes('Audio integrity intact')) return { kind: 'done' }
   if (s.includes('key returned code=500')) return { kind: 'key500' }
   if (s.includes('Unavailable, trying to dl aac-lc')) return { kind: 'aac' }
   if (s.includes('Track already exists locally')) return { kind: 'exists' }
@@ -23,14 +23,9 @@ export function parseLine(line) {
 
 export function classify(log) {
   const text = String(log)
-  const seen = new Set()
-  for (const line of text.split(/\r\n|\r|\n/)) {
-    const r = parseLine(line)
-    if (r) seen.add(r.kind)
-  }
-  if (seen.has('key500')) return 'key500'
-  if (seen.has('aac')) return 'aac'
-  if (seen.has('exists')) return 'exists'
-  if (seen.has('done')) return 'ok'
+  if (text.includes('key returned code=500')) return 'key500'
+  if (text.includes('Unavailable, trying to dl aac-lc')) return 'aac'
+  if (text.includes('Track already exists locally')) return 'exists'
+  if (text.includes('Decrypted') || text.includes('Audio integrity intact')) return 'ok'
   return 'unknown'
 }
