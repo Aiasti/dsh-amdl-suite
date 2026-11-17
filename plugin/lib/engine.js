@@ -61,6 +61,11 @@ export async function statusOf(port, options = {}) {
 /**
  * 确保引擎在跑：已在跑直接复用，否则拉起并轮询到就绪。
  *
+ * `engineDir` 是**引擎产物目录本身**（直接含 `wrapper-lite-qemu.exe` 与 `qemu/` 的那一层），
+ * 不是引擎根。完整示例：`C:\Users\me\.dsh\state\engine\wrapper-lite-qemu`，
+ * 启动器即其下的 `wrapper-lite-qemu.exe`。`deps.js` 的 `plan()` 返回的 `engine.path`
+ * 的 `dirname` 正是这一层，Task 10/12 原样透传即可。传引擎根仅为兼容兜底。
+ *
  * `regions` 可能为空数组——这不算失败，由调用方判断登录态。
  *
  * @param {{
@@ -107,7 +112,12 @@ export async function ensureEngine(options) {
     }
   }
 
-  throw new Error(`引擎在 ${waitMs}ms 内未就绪（端口 ${port}）；日志：${logFile}；目录：${engineDir}`)
+  // 启动器起不来时 `defaultSpawn` 把错误记在 `child.spawnError`（异步 'error' 事件，
+  // 到这里通常已经落定）；拼进超时文案，让"目录错一层"这类问题一眼可见。
+  const reason = child?.spawnError ? `；启动失败：${child.spawnError.message}` : ''
+  throw new Error(
+    `引擎在 ${waitMs}ms 内未就绪（端口 ${port}）；日志：${logFile}；目录：${engineDir}${reason}`,
+  )
 }
 
 /**
@@ -142,8 +152,14 @@ function launcherNameFor(platform) {
 }
 
 /**
- * 启动器绝对路径。`engineDir` 既可能是引擎根（`<state>/engine`，产物在其下
- * `wrapper-lite-qemu/`），也可能是产物目录本身；按目录名判断，两种都不猜错。
+ * 启动器绝对路径。
+ *
+ * `engineDir` 的**主约定**是引擎产物目录本身，即直接包含 `wrapper-lite-qemu.exe`
+ * 与 `qemu/` 的那一层：`<state>/engine/wrapper-lite-qemu`。`deps.js` 的 `plan()`
+ * 已按此布局产出，其返回的 `engine.path` 的 `dirname` 就是这一层，Task 10/12 原样透传。
+ *
+ * 下面的 basename 探测只是**兼容兜底**：万一调用方传的是引擎根 `<state>/engine`，
+ * 再补一层 `wrapper-lite-qemu/`。它不是与主约定等价的可选写法。
  */
 function launcherPathFor(engineDir, platform) {
   const j = joinFor(engineDir).join
@@ -158,7 +174,13 @@ function stamp() {
   return new Date().toISOString().replace(/[:.]/g, '-')
 }
 
-/** 默认 `spawnImpl`：detached 起启动器，stdout/stderr 落到 `opts.logFile`。 */
+/**
+ * 默认 `spawnImpl`：detached 起启动器，stdout/stderr 落到 `opts.logFile`。
+ *
+ * `spawn` 的失败（典型是启动器路径不存在 → `ENOENT`）不是同步抛出，而是异步 `'error'`
+ * 事件；没有监听器就是未捕获异常，会直接打死宿主进程。这里吞掉并记录到
+ * `child.spawnError`，让 `ensureEngine` 的轮询自然超时、再抛带路径的可读错误。
+ */
 function defaultSpawn(exe, args, opts = {}) {
   const logFile = opts.logFile ?? joinFor(exe).join(path.dirname(exe), 'logs', `engine-${stamp()}.log`)
   mkdirSync(path.dirname(logFile), { recursive: true })
@@ -168,6 +190,10 @@ function defaultSpawn(exe, args, opts = {}) {
       cwd: path.dirname(exe),
       detached: true,
       stdio: ['ignore', fd, fd],
+    })
+    // 不 rethrow：进程起不来时交由轮询超时报告，宿主必须活着。
+    child.on?.('error', (err) => {
+      child.spawnError = err
     })
     child.unref()
     return child
