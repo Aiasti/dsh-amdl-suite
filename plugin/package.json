@@ -1,0 +1,14 @@
+{
+  "name": "dsh-amdl-suite",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Download NetEase playlists or Apple Music links as local ALAC files through amdl and wrapper-lite.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "cordis.patch.yml", "lib", "tools", "vendor", "locale", "icon.svg"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

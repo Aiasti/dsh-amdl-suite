@@ -1,0 +1,4 @@
+- insert:
+    - id: amdl-suite
+      name: 'dsh-amdl-suite'
+      config: {}
