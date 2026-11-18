@@ -66,17 +66,24 @@ export function parseJsonSummary(line) {
  *
  * `key500` 与 `exists` 时 amdl 不输出产物路径，`path` 置 `null`。
  *
+ * `verdict` 取值：`ok` | `key500` | `aac` | `exists` | `unknown`（来自 `classify`），
+ * 外加本函数产生的 `timeout`（超时）与 `cancelled`（`signal` 中止），这两种 `path` 均为 `null`。
+ *
+ * 超时或中止时只 `proc.kill()` 直接子进程——`taskkill /T` 清理进程树是 Task 12 的事。
+ *
  * @param {{
  *   amdlPath: string,
  *   configPath: string,
  *   url: string,
  *   spawnImpl?: Function,
  *   onLine?: (line: string, parsed: { kind: string, percent?: number } | null) => void,
+ *   timeoutMs?: number,
+ *   signal?: AbortSignal,
  * }} options
  * @returns {Promise<{ url: string, path: string | null, verdict: string, log: string, exitCode: number }>}
  */
 export function downloadOne(options) {
-  const { amdlPath, configPath, url, onLine } = options
+  const { amdlPath, configPath, url, onLine, timeoutMs, signal } = options
   const spawnImpl = options.spawnImpl ?? spawn
 
   return new Promise((resolve, reject) => {
@@ -113,16 +120,64 @@ export function downloadOne(options) {
     const onChunk = reader()
     const onErrChunk = reader()
 
-    proc.stdout?.on('data', onChunk)
-    proc.stderr?.on('data', onErrChunk)
-    proc.on('error', reject)
-    proc.on('close', (code) => {
+    let settled = false
+    let forced = null
+    let timer = null
+    let closeCode = -1
+
+    // 只落定一次：close 与 timeout/abort 谁先到算谁。落定时清掉定时器与 abort 监听，不留悬挂计时器。
+    // `forced` 先赋值再 kill，即使 kill 同步触发 close，timeout/cancelled 也不会被 classify 覆盖。
+    const settle = () => {
+      if (settled) return
+      settled = true
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      signal?.removeEventListener?.('abort', onAbort)
       onChunk.flush()
       onErrChunk.flush()
-      const verdict = classify(log)
-      const path = verdict === 'key500' || verdict === 'exists' ? null : artifactPathOf(lines)
-      resolve({ url, path, verdict, log, exitCode: code ?? -1 })
+      const verdict = forced ?? classify(log)
+      // timeout / cancelled 没有产物；key500 / exists 时 amdl 不输出路径。
+      const path = forced !== null || verdict === 'key500' || verdict === 'exists'
+        ? null
+        : artifactPathOf(lines)
+      resolve({ url, path, verdict, log, exitCode: closeCode })
+    }
+
+    // 只杀自己 spawn 的子进程；进程树清理（taskkill /T）是 Task 12 的事。
+    const onAbort = () => {
+      forced = 'cancelled'
+      proc.kill?.()
+      settle()
+    }
+
+    proc.stdout?.on('data', onChunk)
+    proc.stderr?.on('data', onErrChunk)
+    proc.on('error', (err) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      signal?.removeEventListener?.('abort', onAbort)
+      reject(err)
     })
+    proc.on('close', (code) => {
+      closeCode = code ?? -1
+      settle()
+    })
+
+    if (timeoutMs !== undefined && timeoutMs !== null) {
+      timer = setTimeout(() => {
+        forced = 'timeout'
+        proc.kill?.()
+        settle()
+      }, timeoutMs)
+    }
+
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
   })
 }
 
