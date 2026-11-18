@@ -1,5 +1,10 @@
+import { Config } from './lib/config-schema.js'
+import { registerSetupTool } from './tools/setup.js'
+
 export const inject = ['tools', 'jobs']
 
+export { Config }
+
 export function apply(ctx, config) {
-  // tools registered by later tasks
+  registerSetupTool(ctx, config)
 }
