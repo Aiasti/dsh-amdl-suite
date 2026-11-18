@@ -9,7 +9,7 @@ import { mkdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/pr
 import path from 'node:path'
 import { promisify } from 'node:util'
 import * as realDeps from './deps.js'
-import { pathsFor } from './paths.js'
+import { pathsFor, stateDir } from './paths.js'
 
 const run = promisify(execFile)
 
@@ -25,11 +25,13 @@ const ENGINE_BYTES = 157822346
 const ENGINE_SECONDS = 225
 
 /**
- * 解压后体积估算：zip 里主要是 `qemu/data.img`（已接近不可压缩），其余是二进制。
- * 真实解压体积只有下载后才知道，这里按 zip 的 3× 取保守上限；盘预检要求可用空间
- * ≥ 该估算 × 1.5。
+ * 解压后体积：**实测值**，不是估算。
+ *
+ * 从 157,822,346 B 的 artifact 中央目录累加所有条目的未压缩尺寸得 671,680,269 B（640.6 MB），
+ * 即 zip 的 4.26×。之前按 3× 估会算成 677 MB 门槛，比真实占用（解压 640.6 MB + 保留的
+ * zip 157.8 MB = 798 MB）**少 121 MB**——预检形同虚设，会在解压中途 ENOSPC。
  */
-const ENGINE_UNPACKED_BYTES = ENGINE_BYTES * 3
+const ENGINE_UNPACKED_BYTES = 671680269
 
 const AMDL_BASE = 'https://github.com/zhaarey/apple-music-downloader/releases/latest/download'
 
@@ -52,22 +54,35 @@ const exists = async (file) => {
   }
 }
 
-/** 可用字节；查不到时返回 `null`，由调用方决定是否跳过预检。 */
+/**
+ * 查目标盘的可用字节。
+ *
+ * 目录可能还不存在，所以回溯到存在的祖先再查（同一分区）。
+ * 返回值区分两种"查不到"：`depth`（回溯 8 层仍无存在目录）与 `statfs`（系统调用失败）——
+ * 把两者混成一句「statfs 不可用」会让人排查错方向。
+ *
+ * @returns {Promise<{ bytes: number | null, why?: 'depth' | 'statfs' }>}
+ */
 async function freeBytes(dir) {
   let probe = dir
   for (let i = 0; i < 8; i++) {
     try {
       const s = await statfs(probe)
-      return s.bsize * s.bavail
+      return { bytes: s.bsize * s.bavail }
     } catch {
-      // 目录可能还不存在：往上找到存在的祖先再查（同一分区）
       const parent = path.dirname(probe)
-      if (parent === probe) break
+      if (parent === probe) return { bytes: null, why: 'statfs' }
       probe = parent
     }
   }
-  return null
+  return { bytes: null, why: 'depth' }
 }
+
+/** 预检被跳过时给用户看的成因文案。 */
+const freeBytesWhy = (why) =>
+  why === 'depth'
+    ? '路径层级过深，回溯 8 层仍未找到已存在的目录'
+    : 'statfs 不可用'
 
 const sha256Match = (expected, actual) =>
   String(expected).replace(/^sha256:/i, '').toLowerCase() === String(actual).toLowerCase()
@@ -104,39 +119,66 @@ function processAlive(pid) {
  * 取 `<root>/.setup.lock`。已被占用且持有者仍活着、锁不到 30 分钟 → 直接报错，
  * 不阻塞等待；反之视为崩溃遗留，抢占并在 summary 里说明。
  *
- * @returns {Promise<{ preempted: { pid?: number, time?: number } | null }>}
+ * **抢占也必须是互斥的**：若用 `writeFile` 直接覆盖，两个进程会同时认为自己持锁，
+ * 都写同一个 `bin/amdl.exe`（实测两个都返回 ok=true，最终内容取决于谁后结束）。
+ * 所以抢占走「删残留锁 → `wx` 重建」，`wx` 本身提供互斥；拿不到就重读一次再判定。
+ *
+ * @returns {Promise<{ preempted: { pid?: number, time?: number, corrupt?: boolean } | null }>}
  */
 async function acquireLock(root) {
   const file = joinFor(root).join(root, '.setup.lock')
   await mkdir(root, { recursive: true })
   const mine = JSON.stringify({ pid: process.pid, time: Date.now() })
+  let lastHolder = null
 
-  try {
-    await writeFile(file, mine, { flag: 'wx' })
-    return { preempted: null }
-  } catch (err) {
-    if (err.code !== 'EEXIST') throw err
+  // 最多两轮：第一轮正常抢，第二轮在被别人抢占后重试一次
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await writeFile(file, mine, { flag: 'wx' })
+      return { preempted: attempt === 0 ? null : lastHolder }
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+    }
+
+    let holder = null
+    let corrupt = false
+    try {
+      const raw = await readFile(file, 'utf8')
+      holder = JSON.parse(raw)
+    } catch (err) {
+      if (err.code !== 'ENOENT') corrupt = true
+    }
+    lastHolder = corrupt ? { corrupt: true } : holder
+
+    if (corrupt) {
+      // 锁内容坏了：没法判断持有者，删掉重抢（wx 保证只有一个赢）
+      await rm(file, { force: true })
+      continue
+    }
+
+    const age = Date.now() - Number(holder?.time ?? 0)
+    const stale = !processAlive(Number(holder?.pid)) || !(age < LOCK_STALE_MS)
+    if (!stale) {
+      throw new Error(`另一个 amdl_setup 正在运行（pid ${holder?.pid}），请等待其结束而不是并发执行`)
+    }
+
+    // 残留锁：删掉后用 wx 重建。若这一瞬间别人先建成，下一轮会看到活 pid 而拒绝。
+    await rm(file, { force: true })
   }
 
-  let holder = null
-  try {
-    holder = JSON.parse(await readFile(file, 'utf8'))
-  } catch {
-    holder = null
-  }
-
-  const age = Date.now() - Number(holder?.time ?? 0)
-  const stale = !processAlive(Number(holder?.pid)) || !(age < LOCK_STALE_MS)
-  if (!stale) {
-    throw new Error(`另一个 amdl_setup 正在运行（pid ${holder?.pid}），请等待其结束而不是并发执行`)
-  }
-
-  await writeFile(file, mine)
-  return { preempted: holder }
+  throw new Error('无法获取 amdl_setup 锁：并发争抢中被其它进程先取得，请稍后重试')
 }
 
+/** 只删除自己持有的锁：内容里的 pid 不是当前进程就不动别人的锁。 */
 async function releaseLock(root) {
-  await rm(joinFor(root).join(root, '.setup.lock'), { force: true })
+  const file = joinFor(root).join(root, '.setup.lock')
+  try {
+    const holder = JSON.parse(await readFile(file, 'utf8'))
+    if (Number(holder?.pid) !== process.pid) return
+  } catch {
+    return
+  }
+  await rm(file, { force: true })
 }
 
 async function withLock(root, body) {
@@ -151,7 +193,9 @@ async function withLock(root, body) {
 const lockNote = (preempted) =>
   preempted === null
     ? []
-    : [`锁：接管了残留锁（原 pid ${preempted?.pid ?? '未知'}，时间 ${new Date(preempted?.time ?? 0).toISOString()}）`]
+    : preempted?.corrupt === true
+      ? ['锁：接管了内容损坏的残留锁（无法读出 pid/时间），已重建']
+      : [`锁：接管了残留锁（原 pid ${preempted?.pid ?? '未知'}，时间 ${new Date(preempted?.time ?? 0).toISOString()}）`]
 
 function planItems(planned) {
   return [
@@ -187,9 +231,9 @@ async function planAction({ root, platform, d, config }) {
     `目标引擎版本：run_id ${runId}，资产 ${ENGINE_ARTIFACT}，${ENGINE_BYTES.toLocaleString('en-US')} B，`
       + `sha256 ${String(config.engineSha256 || ENGINE_SHA256).replace(/^sha256:/i, '').slice(0, 12)}…`,
     `预计耗时：先下 amdl（约 4 s），再下引擎（约 ${ENGINE_SECONDS} s），最后解压并校验四个关键文件`,
-    free === null
-      ? '磁盘空间：无法预检（statfs 不可用），fetch-engine 会再查一次'
-      : `磁盘空间：${gb(free)} 可用，fetch-engine 要求 ≥ ${gb(need)}（解压后估算 ${gb(ENGINE_UNPACKED_BYTES)} × 1.5）`,
+    free.bytes === null
+      ? `磁盘空间：无法预检（${freeBytesWhy(free.why)}），fetch-engine 会再查一次`
+      : `磁盘空间：${gb(free.bytes)} 可用，fetch-engine 要求 ≥ ${gb(need)}（解压后 ${gb(ENGINE_UNPACKED_BYTES)} + 保留 zip）`,
     `产物落位：引擎 ${planned.engine.path}；amdl ${planned.amdl.path}`,
   ].filter((line) => line !== null)
 
@@ -232,7 +276,10 @@ async function fetchAmdlAction({ root, platform, d }) {
       await d.downloadToFile(sumsUrl, sums)
       expected = expectedShaFor(await readFile(sums, 'utf8'), asset)
     } finally {
+      // `.partial` 也要清：checksums.txt 每次发版都变，残留的 partial 会让下次
+      // downloadToFile 带 Range 续传、拼出错文件，用户看到的是「sha256 不符」而非网络错误。
       await rm(sums, { force: true })
+      await rm(`${sums}.partial`, { force: true })
     }
 
     await d.downloadToFile(assetUrl, staged)
@@ -267,7 +314,13 @@ async function fetchAmdlAction({ root, platform, d }) {
 
 async function fetchEngineAction({ root, platform, d, config }) {
   const engineRoot = pathsFor(root).engine
-  const zipPath = joinFor(root).join(engineRoot, 'wrapper-lite-qemu.zip')
+  // 真实 artifact 的顶层条目是 LICENSE / qemu/ / README.md / wrapper-lite-qemu.exe，
+  // **没有** `wrapper-lite-qemu/` 这一层；而 deps.verify 找的是
+  // `<root>/engine/wrapper-lite-qemu/<四个文件>`。所以必须解压到产物目录本身，
+  // 否则会得到 <root>/engine/qemu/data.img，verify 必然报「缺少 4 个文件」。
+  const j = joinFor(root).join
+  const productDir = j(engineRoot, 'wrapper-lite-qemu')
+  const zipPath = j(engineRoot, 'wrapper-lite-qemu.zip')
   const runId = config.engineRunId || ENGINE_RUN_ID
   const want = String(config.engineSha256 || ENGINE_SHA256)
   const url = d.assetUrlFor('win32', runId, ENGINE_ARTIFACT)
@@ -276,10 +329,10 @@ async function fetchEngineAction({ root, platform, d, config }) {
 
   const free = await freeBytes(engineRoot)
   const need = ENGINE_UNPACKED_BYTES * 1.5
-  if (free !== null && free < need) {
+  if (free.bytes !== null && free.bytes < need) {
     throw new Error(
-      `磁盘空间不足：${engineRoot} 可用 ${gb(free)}，解压后估算 ${gb(ENGINE_UNPACKED_BYTES)}，`
-        + `要求 ≥ ${gb(need)}（× 1.5）。请腾出空间或改 engineDir`,
+      `磁盘空间不足：${engineRoot} 可用 ${gb(free.bytes)}，解压后 ${gb(ENGINE_UNPACKED_BYTES)}，`
+        + `要求 ≥ ${gb(need)}（解压 + 保留 zip）。请腾出空间或改 engineDir`,
     )
   }
 
@@ -300,26 +353,31 @@ async function fetchEngineAction({ root, platform, d, config }) {
       }
     }
 
+    await mkdir(productDir, { recursive: true })
+    // 旧版本可能把内容散落在 <root>/engine 下（历史 bug 的解压位置），先清掉避免两套树并存
+    for (const stale of ['wrapper-lite-qemu.exe', 'qemu', 'LICENSE', 'README.md']) {
+      await rm(j(engineRoot, stale), { recursive: true, force: true })
+    }
     try {
       // 参数数组，不拼 shell 字符串：路径含空格/中文时拼串会炸
-      await run('tar', ['-xf', zipPath, '-C', engineRoot], { windowsHide: true })
+      await run('tar', ['-xf', zipPath, '-C', productDir], { windowsHide: true })
     } catch (err) {
       const detail = String(err?.stderr ?? err?.message ?? err).trim()
       throw new Error(
-        `解压失败（tar -xf "${zipPath}" -C "${engineRoot}"）：${detail}。`
+        `解压失败（tar -xf "${zipPath}" -C "${productDir}"）：${detail}。`
           + 'Windows 10/11 自带 tar.exe；若缺失请安装 bsdtar，或手动把该 zip 解压到上述目录',
       )
     }
 
     const verified = await d.verify(root, { platform })
     // `verify` 恒返回 5 项（引擎 4 文件 + amdl），而本 action 只负责引擎：
-    // 只认 `<root>/engine/` 下的项，否则首次只跑 fetch-engine 会因 amdl 未装而误报失败。
-    const engineItems = verified.items.filter((item) => isInside(engineRoot, item.path))
+    // 只认产物目录下的项，否则首次只跑 fetch-engine 会因 amdl 未装而误报失败。
+    const engineItems = verified.items.filter((item) => isInside(productDir, item.path))
     const broken = engineItems.filter((item) => item.problem !== undefined)
     if (engineItems.length === 0 || broken.length > 0) {
       const problems = broken.length > 0
         ? broken.map((i) => i.problem)
-        : [`校验未覆盖引擎目录 ${engineRoot}，解压结果无法确认`]
+        : [`校验未覆盖引擎目录 ${productDir}，解压结果无法确认`]
       throw new Error(`解压后校验失败，引擎不完整：\n${problems.join('\n')}`)
     }
 
@@ -332,12 +390,47 @@ async function fetchEngineAction({ root, platform, d, config }) {
           ? `引擎 zip 已存在且 sha256 相符，跳过下载直接解压：${zipPath}`
           : `引擎已下载并通过校验：${zipPath}（${ENGINE_BYTES.toLocaleString('en-US')} B）`,
         `版本：run_id ${runId}，资产 ${ENGINE_ARTIFACT}`,
-        `解压到：${engineRoot}（zip 保留，便于重解压）`,
+        `解压到：${productDir}（zip 保留，便于重解压）`,
         `校验：引擎四个关键文件齐全（${engineItems.length} / ${verified.items.length} 项通过；amdl 由 fetch-amdl 负责）`,
         ...lockNote(preempted),
       ].join('\n'),
     }
   })
+}
+
+/**
+ * 从 Config 推出状态根目录。
+ *
+ * `config.engineDir` 按 Ruling 12 是**引擎产物目录本身**，即 `<root>/engine/wrapper-lite-qemu`，
+ * 所以往上两层才是 root。留空则用 `stateDir()`。
+ *
+ * **不能无条件往上取两层**：用户可能填 `D:\my-engine\wrapper-lite-qemu`，
+ * 两层会得到 `D:\`，随后会 `mkdir D:\engine`——写到盘根。所以推导后必须校验形状，
+ * 不满足就抛错让用户明确该填什么，**绝不回落到盘根**。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {{ stateDir?: () => string }} [deps]
+ * @returns {string}
+ */
+export function rootFor(config, deps = {}) {
+  const engineDir = typeof config?.engineDir === 'string' ? config.engineDir.trim() : ''
+  if (engineDir === '') return (deps.stateDir ?? stateDir)()
+
+  const p = path.win32.isAbsolute(engineDir) ? path.win32 : path
+  const resolved = p.resolve(engineDir)
+  const base = p.basename(resolved)
+  const parent = p.basename(p.dirname(resolved))
+
+  if (base !== 'wrapper-lite-qemu' || parent !== 'engine') {
+    throw new Error(
+      `config.engineDir 的形状不对：期望 <root>/engine/wrapper-lite-qemu，实得 ${resolved}。`
+        + '请填到 wrapper-lite-qemu 这一层（它下面应直接是 wrapper-lite-qemu.exe 与 qemu/），'
+        + '或留空使用默认状态目录。'
+        + '（拒绝从该路径反推根目录，避免把产物写到盘根。）',
+    )
+  }
+
+  return p.dirname(p.dirname(resolved))
 }
 
 /**
