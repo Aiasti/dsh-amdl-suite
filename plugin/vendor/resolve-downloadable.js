@@ -108,8 +108,8 @@ const searchSongs = async (sf, term) => {
 
   // 去重：同一 Apple trackId 只保留第一次出现，重复项标 duplicate（否则第二次必撞 Track already exists）
   // 按 `?i=<trackId>` 比较而非整串 URL：同一 trackId 在专辑段不同的链接也必须算重复。
-  // 没有 `?i=` 的（整张专辑链接）退回整串 URL 比较，保持原有行为。
-  const dedupeKey = u => { const m = /\?i=(\d+)/.exec(u || ''); return m ? 'i:' + m[1] : (u || '') };
+  // 没有 `i=` 的（整张专辑链接）退回整串 URL 比较，保持原有行为。
+  const dedupeKey = u => { const m = /[?&]i=(\d+)/.exec(u || ''); return m ? 'i:' + m[1] : (u || '') };
   const seenKey = new Set();
   for (const r of rows) {
     const key = dedupeKey(r.url);
@@ -118,8 +118,11 @@ const searchSongs = async (sf, term) => {
   }
   const urls = rows.filter(r => r.url && !r.duplicate).map(r => r.url);
   fs.writeFileSync(OUT + '-download-cn.txt', urls.join('\n') + (urls.length ? '\n' : ''), 'utf8');
+  // 汇总必须分三项数：可下 / 重复（同一 Apple id 被多首指向）/ 无资产，否则重复被算成无资产
+  const noAsset = rows.filter(r => !r.url).length;
+  const dupCount = rows.filter(r => r.duplicate).length;
   const L = ['# 国区可下载性核对', '',
-    `来源：${path.basename(reportFile)}　共 ${rows.length} 首　可下 ${urls.length}　国区无资产 ${rows.length - urls.length}`, '',
+    `来源：${path.basename(reportFile)}　共 ${rows.length} 首　可下 ${urls.length}　重复 ${dupCount}　国区无资产 ${noAsset}`, '',
     '| # | 网易云曲名 | 网易云歌手 | 判定 | 国区曲目 | 说明 | 原命中区 |', '|---|---|---|---|---|---|---|'];
   for (const r of rows) {
     L.push(`| ${r.idx} | ${String(r.name).replace(/\|/g, '\\|')} | ${String(r.artist).replace(/\|/g, '\\|')} | ${r.verdict} | ${String(r.apple).replace(/\|/g, '\\|')} | ${r.how} | ${r.origin} |`);
@@ -128,6 +131,6 @@ const searchSongs = async (sf, term) => {
   fs.writeFileSync(OUT + '-cn-report.md', L.join('\n'), 'utf8');
   // 机器可读结果：后续下载按 idx 回连 pl.json / pl-report.json，不解析 md
   fs.writeFileSync(OUT + '-download-cn.json', JSON.stringify(rows, null, 1), 'utf8');
-  console.log(`\n可下 ${urls.length} / ${rows.length}`);
+  console.log(`\n可下 ${urls.length} / ${rows.length}（重复 ${dupCount}，无资产 ${noAsset}）`);
   console.log(`产出：${OUT}-download-cn.txt / ${OUT}-download-cn.json / ${OUT}-cn-report.md`);
 })();
