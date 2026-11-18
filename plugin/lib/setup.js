@@ -119,57 +119,79 @@ function processAlive(pid) {
  * 取 `<root>/.setup.lock`。已被占用且持有者仍活着、锁不到 30 分钟 → 直接报错，
  * 不阻塞等待；反之视为崩溃遗留，抢占并在 summary 里说明。
  *
- * **抢占也必须是互斥的**：若用 `writeFile` 直接覆盖，两个进程会同时认为自己持锁，
- * 都写同一个 `bin/amdl.exe`（实测两个都返回 ok=true，最终内容取决于谁后结束）。
- * 所以抢占走「删残留锁 → `wx` 重建」，`wx` 本身提供互斥；拿不到就重读一次再判定。
+ * **抢占必须是互斥的，且不能盲删。** 两条路径都会导致两个进程同时自认持锁：
  *
+ * 1. 用 `writeFile` 直接覆盖抢占 —— 双方都写成功。
+ * 2. 判定残留后无条件 `rm(file)` —— 若此刻另一个刚释放、第三个刚 `wx` 建好新锁，
+ *    这个 `rm` 会把**别人的新锁**删掉，随后自己再 `wx` 成功，于是两人都持锁。
+ *    `readFile` 得 ENOENT（锁在 `wx` 失败与读取之间消失）时尤其危险，因为
+ *    `holder` 为 null 会被判成 stale，接着就走进盲删。
+ *
+ * 所以：ENOENT 时**不删任何东西**，直接重试 `wx`；判定残留时用 `rename` 把旧锁
+ * 原子地挪走（`rename` 在源不存在时抛 ENOENT，天然只允许一个进程搬走同一把锁），
+ * 搬走成功者才去 `wx` 建新锁，输的那方下一轮会读到活 pid 而拒绝。
+ *
+ * @param {string} root
+ * @param {{ ops?: Record<string, Function> }} [options] 便于测试注入 fs 操作
  * @returns {Promise<{ preempted: { pid?: number, time?: number, corrupt?: boolean } | null }>}
  */
-async function acquireLock(root) {
+async function acquireLock(root, options = {}) {
+  const ops = { writeFile, readFile, rm, rename, mkdir, ...(options.ops ?? {}) }
   const file = joinFor(root).join(root, '.setup.lock')
-  await mkdir(root, { recursive: true })
+  await ops.mkdir(root, { recursive: true })
   const mine = JSON.stringify({ pid: process.pid, time: Date.now() })
   let lastHolder = null
 
-  // 最多两轮：第一轮正常抢，第二轮在被别人抢占后重试一次
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // 最多三轮：抢 → 被抢后再判一次 → 兜底重试
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await writeFile(file, mine, { flag: 'wx' })
+      await ops.writeFile(file, mine, { flag: 'wx' })
       return { preempted: attempt === 0 ? null : lastHolder }
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
     }
 
     let holder = null
+    let gone = false
     let corrupt = false
     try {
-      const raw = await readFile(file, 'utf8')
+      const raw = await ops.readFile(file, 'utf8')
       holder = JSON.parse(raw)
     } catch (err) {
-      if (err.code !== 'ENOENT') corrupt = true
+      if (err.code === 'ENOENT') gone = true
+      else corrupt = true
     }
+
+    // 锁在我们读取前已经消失：什么都没得删，直接回去重试 wx。
+    // 这里**绝不能** rm —— 那会删掉别人刚建好的新锁，造成双持。
+    if (gone) continue
+
     lastHolder = corrupt ? { corrupt: true } : holder
 
-    if (corrupt) {
-      // 锁内容坏了：没法判断持有者，删掉重抢（wx 保证只有一个赢）
-      await rm(file, { force: true })
-      continue
-    }
-
     const age = Date.now() - Number(holder?.time ?? 0)
-    const stale = !processAlive(Number(holder?.pid)) || !(age < LOCK_STALE_MS)
+    const stale = corrupt || !processAlive(Number(holder?.pid)) || !(age < LOCK_STALE_MS)
     if (!stale) {
       throw new Error(`另一个 amdl_setup 正在运行（pid ${holder?.pid}），请等待其结束而不是并发执行`)
     }
 
-    // 残留锁：删掉后用 wx 重建。若这一瞬间别人先建成，下一轮会看到活 pid 而拒绝。
-    await rm(file, { force: true })
+    // 原子搬走残留锁：rename 在源不存在时抛 ENOENT，所以同一把锁只会被一个进程搬走。
+    // 搬走后到 wx 之间若第三者抢先建锁，我们这轮 wx 得 EEXIST，下一轮会读到活 pid 而拒绝。
+    const grave = `${file}.${process.pid}.stale`
+    try {
+      await ops.rename(file, grave)
+    } catch (err) {
+      if (err.code === 'ENOENT') continue
+      throw err
+    }
+    await ops.rm(grave, { force: true })
   }
 
   throw new Error('无法获取 amdl_setup 锁：并发争抢中被其它进程先取得，请稍后重试')
 }
 
-/** 只删除自己持有的锁：内容里的 pid 不是当前进程就不动别人的锁。 */
+/**
+ * 只删除自己持有的锁：内容里的 pid 不是当前进程就不动别人的锁。
+ */
 async function releaseLock(root) {
   const file = joinFor(root).join(root, '.setup.lock')
   try {
@@ -180,6 +202,9 @@ async function releaseLock(root) {
   }
   await rm(file, { force: true })
 }
+
+// 导出仅供测试注入 fs 操作：锁的竞态只有在能精确控制每个 fs 调用时才能确定性复现。
+export const _lock = { acquire: acquireLock, release: releaseLock }
 
 async function withLock(root, body) {
   const { preempted } = await acquireLock(root)
