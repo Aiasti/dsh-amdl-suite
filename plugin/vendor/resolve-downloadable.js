@@ -106,11 +106,15 @@ const searchSongs = async (sf, term) => {
     console.log(`${String(r.idx).padStart(3)} ${verdict}  ${r.name}  →  ${cn ? cn.name : '(无)'}  ${how}`);
   }
 
-  // 去重：同一 Apple URL 只保留第一次出现，重复项标 duplicate（否则第二次必撞 Track already exists）
-  const seenUrl = new Set();
+  // 去重：同一 Apple trackId 只保留第一次出现，重复项标 duplicate（否则第二次必撞 Track already exists）
+  // 按 `?i=<trackId>` 比较而非整串 URL：同一 trackId 在专辑段不同的链接也必须算重复。
+  // 没有 `?i=` 的（整张专辑链接）退回整串 URL 比较，保持原有行为。
+  const dedupeKey = u => { const m = /\?i=(\d+)/.exec(u || ''); return m ? 'i:' + m[1] : (u || '') };
+  const seenKey = new Set();
   for (const r of rows) {
-    if (r.url && seenUrl.has(r.url)) r.duplicate = true;
-    else if (r.url) seenUrl.add(r.url);
+    const key = dedupeKey(r.url);
+    if (key && seenKey.has(key)) r.duplicate = true;
+    else if (key) seenKey.add(key);
   }
   const urls = rows.filter(r => r.url && !r.duplicate).map(r => r.url);
   fs.writeFileSync(OUT + '-download-cn.txt', urls.join('\n') + (urls.length ? '\n' : ''), 'utf8');
