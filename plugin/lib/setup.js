@@ -174,7 +174,6 @@ async function acquireLock(root, options = {}) {
       throw new Error(`另一个 amdl_setup 正在运行（pid ${holder?.pid}），请等待其结束而不是并发执行`)
     }
 
-    // 原子搬走残留锁：rename 在源不存在时抛 ENOENT，所以同一把锁只会被一个进程搬走。
     // 搬走后到 wx 之间若第三者抢先建锁，我们这轮 wx 得 EEXIST，下一轮会读到活 pid 而拒绝。
     const grave = `${file}.${process.pid}.stale`
     try {
@@ -183,7 +182,12 @@ async function acquireLock(root, options = {}) {
       if (err.code === 'ENOENT') continue
       throw err
     }
-    await ops.rm(grave, { force: true })
+    // 清掉搬出来的旧锁。失败（被杀软/索引占用时的 EPERM/EBUSY）不影响正确性：
+    // 锁文件已不在，别的进程可以正常 wx；只是 root 下多个几字节垃圾。
+    // 不要把这种 fs 错误抛给用户——他看到的应该是"装依赖失败"，而不是一个裸 errno。
+    try {
+      await ops.rm(grave, { force: true })
+    } catch { /* 残留 .stale 不影响后续 acquire */ }
   }
 
   throw new Error('无法获取 amdl_setup 锁：并发争抢中被其它进程先取得，请稍后重试')
