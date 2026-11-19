@@ -16,6 +16,7 @@ import { buildConfig, downloadOne } from './amdl.js'
 import { ensureEngine, stopEngine } from './engine.js'
 import { pathsFor } from './paths.js'
 import { splitLines } from './logparse.js'
+import { killTree } from './proctree.js'
 import { toYaml } from './yaml.js'
 
 const joinFor = (root) => (String(root).includes('\\') ? path.win32 : path.posix)
@@ -23,24 +24,6 @@ const joinFor = (root) => (String(root).includes('\\') ? path.win32 : path.posix
 const VENDOR = fileURLToPath(new URL('../vendor/', import.meta.url))
 
 const PORT = 12340
-
-/**
- * 杀掉 amdl 的**进程树**（design §6.7）。
- *
- * `proc.kill()` 只结束直接子进程；amdl 派生的子进程会活下来，会话关掉后仍在跑。
- * Windows 用 `taskkill /T /F`，其它平台退化成按 pid 直接杀（第一版只做 Windows）。
- */
-function killTree(pid) {
-  if (!Number.isInteger(pid)) return
-  if (process.platform === 'win32') {
-    const proc = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true })
-    // 进程已退出时 taskkill 返回非零；不接住异步 'error' 会变成未捕获异常崩宿主
-    proc.on?.('error', () => {})
-    proc.unref?.()
-    return
-  }
-  try { process.kill(pid, 'SIGKILL') } catch { /* 已退出 */ }
-}
 
 /**
  * 判定输入模式。两个都给或都不给都算用法错误——不要"猜一个"。
@@ -278,6 +261,9 @@ export async function runDownloads(options) {
   const verify = deps.verifyAlac ?? ((dir) => verifyAlac(dir, { spawnImpl, root }))
 
   const base = { mode, outputDir, engineDir, amdlPath, urls: urls.length }
+  const results = []
+  let suspicious = []
+  let quality = { error: '未执行到音质复核' }
 
   // 1. 起引擎（已在线则复用，不碰别人的进程）
   append(`起引擎：${engineDir}`)
@@ -296,79 +282,80 @@ export async function runDownloads(options) {
       loginRequired: true,
     }
   }
+  const selfStarted = engine?.reused === false && engine?.pid !== null && engine?.pid !== undefined
   if (engine?.reused === true) append('复用了已在运行的引擎（结束时不会停它）')
   // 只停自己拉起的那个；cancel 路径也要停，否则会话关了引擎会残留
-  if (engine?.reused === false && engine?.pid !== null && engine?.pid !== undefined) {
-    registerCancel(() => { stop(engine.pid).catch(() => {}) })
-  }
+  if (selfStarted) registerCancel(() => { stop(engine.pid).catch(() => {}) })
 
-  // 2. 生成 config.yaml —— 落到插件自己的 config 目录，不碰用户现有的
-  const cfgPath = j(paths.config, 'amdl.yaml')
-  await mkdir(paths.config, { recursive: true })
-  const storefront = String(config.storefront ?? (engine?.regions?.[0] ?? 'us'))
-  await writeFile(cfgPath, toYaml(buildConfig({
-    liteServer: `http://127.0.0.1:${PORT}`,
-    storefront,
-    alacDir: outputDir,
-    alacMax: Number(config.alacMax ?? 192000),
-  })), 'utf8')
-  await mkdir(outputDir, { recursive: true })
-  append(`配置：${cfgPath}（storefront=${storefront}）；产物落位：${outputDir}`)
-
-  // 3. 逐首串行
-  const controller = new AbortController()
-  registerCancel(() => controller.abort())
-  const stall = startStallWatch({
-    seconds: Number(config.stagnationSeconds ?? 60),
-    append,
-    now: deps.now ?? Date.now,
-    timers: deps.timers ?? { setInterval, clearInterval },
-  })
-  const results = []
   try {
-    for (const [i, item] of urls.entries()) {
-      if (isCancelled()) {
-        append(`已取消：完成 ${i} / ${urls.length}`)
-        break
+    // 2. 生成 config.yaml —— 落到插件自己的 config 目录，不碰用户现有的
+    const cfgPath = j(paths.config, 'amdl.yaml')
+    await mkdir(paths.config, { recursive: true })
+    const storefront = String(config.storefront ?? (engine?.regions?.[0] ?? 'us'))
+    await writeFile(cfgPath, toYaml(buildConfig({
+      liteServer: `http://127.0.0.1:${PORT}`,
+      storefront,
+      alacDir: outputDir,
+      alacMax: Number(config.alacMax ?? 192000),
+    })), 'utf8')
+    await mkdir(outputDir, { recursive: true })
+    append(`配置：${cfgPath}（storefront=${storefront}）；产物落位：${outputDir}`)
+
+    // 3. 逐首串行。**不传 `timeoutMs`**：design §6.9 明确不设硬超时（用户已否决），
+    // 卡住与否由「疑似停滞」提示交给 Agent 判断；取消走 `signal`。
+    const controller = new AbortController()
+    registerCancel(() => controller.abort())
+    const stall = startStallWatch({
+      seconds: Number(config.stagnationSeconds ?? 60),
+      append,
+      now: deps.now ?? Date.now,
+      timers: deps.timers ?? { setInterval, clearInterval },
+    })
+    try {
+      for (const [i, item] of urls.entries()) {
+        if (isCancelled()) {
+          append(`已取消：完成 ${i} / ${urls.length}`)
+          break
+        }
+        const label = item.idx === undefined ? item.url : `#${item.idx} ${item.url}`
+        append(`[${i + 1}/${urls.length}] ${label}`)
+        stall.touch()
+        const r = await one({
+          amdlPath,
+          configPath: cfgPath,
+          url: item.url,
+          signal: controller.signal,
+          killTree: kill,
+          onLine: (line) => {
+            if (String(line).trim() === '') return
+            stall.touch()
+            append(String(line))
+          },
+        })
+        results.push({ ...r, idx: item.idx })
+        if (r.verdict !== 'ok' && r.verdict !== 'aac' && r.verdict !== 'exists') {
+          append(`[${i + 1}/${urls.length}] 判定 ${r.verdict}${r.path ? ` → ${r.path}` : ''}`)
+        }
       }
-      const label = item.idx === undefined ? item.url : `#${item.idx} ${item.url}`
-      append(`[${i + 1}/${urls.length}] ${label}`)
-      stall.touch()
-      const r = await one({
-        amdlPath,
-        configPath: cfgPath,
-        url: item.url,
-        signal: controller.signal,
-        killTree: kill,
-        onLine: (line) => {
-          if (String(line).trim() === '') return
-          stall.touch()
-          append(String(line))
-        },
-      })
-      results.push({ ...r, idx: item.idx })
-      if (r.verdict !== 'ok' && r.verdict !== 'aac' && r.verdict !== 'exists') {
-        append(`[${i + 1}/${urls.length}] 判定 ${r.verdict}${r.path ? ` → ${r.path}` : ''}`)
-      }
+    } finally {
+      stall.stop()
+    }
+
+    // 4. 收尾：只报告可疑项，绝不删除
+    const entries = await collectEntries(outputDir)
+    suspicious = findSuspicious(entries)
+    quality = await verify(outputDir)
+
+    if (suspicious.length > 0) {
+      append(`可疑项 ${suspicious.length} 个（未删除，请自行确认）：`)
+      for (const s of suspicious) append(`  ${s.dir} —— ${s.reason}`)
     }
   } finally {
-    stall.stop()
-  }
-
-  // 4. 收尾：只报告可疑项，绝不删除
-  const entries = await collectEntries(outputDir)
-  const suspicious = findSuspicious(entries)
-  const quality = await verify(outputDir)
-
-  if (suspicious.length > 0) {
-    append(`可疑项 ${suspicious.length} 个（未删除，请自行确认）：`)
-    for (const s of suspicious) append(`  ${s.dir} —— ${s.reason}`)
-  }
-
-  // 5. 停引擎（只停自己拉起的）
-  if (engine?.reused === false && engine?.pid !== null && engine?.pid !== undefined) {
-    await stop(engine.pid)
-    append('已停掉本工具拉起的引擎')
+    // 5. 停引擎：无论上面成功还是抛错，自己拉起的都要停掉
+    if (selfStarted) {
+      await stop(engine.pid).catch(() => {})
+      append('已停掉本工具拉起的引擎')
+    }
   }
 
   return {

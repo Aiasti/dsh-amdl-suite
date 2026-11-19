@@ -8,11 +8,12 @@
  * 就读不到 `pl-download-cn.json`，所以 `runMatch` 的 fork 参数被测试逐字钉住。
  */
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, readFile, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { splitLines } from './logparse.js'
 import { pathsFor, workDirFor } from './paths.js'
+import { killTree } from './proctree.js'
 
 const joinFor = (root) => (String(root).includes('\\') ? path.win32 : path.posix)
 
@@ -136,13 +137,14 @@ export async function ensureWordLists(root) {
  *
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
-function runScript(script, args, { env, root, spawnImpl, onLine }) {
+function runScript(script, args, { env, root, spawnImpl, onLine, onChild }) {
   const j = joinFor(root).join
   return new Promise((resolve, reject) => {
     const proc = spawnImpl(process.execPath, [j(VENDOR, script), ...args], {
       env,
       windowsHide: true,
     })
+    onChild?.(proc)
     let stdout = ''
     let stderr = ''
 
@@ -172,6 +174,7 @@ function runScript(script, args, { env, root, spawnImpl, onLine }) {
 
     proc.on?.('error', reject)
     proc.on?.('close', (code) => {
+      onChild?.(null)
       flushOut()
       flushErr()
       resolve({ code: code ?? -1, stdout, stderr })
@@ -193,9 +196,22 @@ function runScript(script, args, { env, root, spawnImpl, onLine }) {
  * @returns {Promise<ReturnType<typeof summarize> & { workDir: string, reportPath: string, cancelled?: boolean }>}
  */
 export async function runMatch(options) {
-  const { playlistUrl, root, config = {}, append = () => {}, isCancelled = () => false, deps = {} } = options
+  const {
+    playlistUrl, root, config = {}, append = () => {},
+    isCancelled = () => false, registerCancel = () => {}, deps = {},
+  } = options
   const spawnImpl = deps.spawn ?? spawn
   const now = deps.now ?? Date.now
+  const kill = deps.killTree ?? killTree
+
+  // 取消要能打断正在跑的 vendor 脚本：`--min-interval 900` 让大歌单要跑很久，
+  // 只"步骤之间检查"等于 job 显示 killed 而脚本仍在写同一目录（design §6.7）。
+  let current = null
+  registerCancel(() => {
+    const pid = current?.pid
+    if (Number.isInteger(pid)) kill(pid)
+  })
+  const onChild = (proc) => { current = proc }
 
   const id = playlistIdOf(playlistUrl)
   const j = joinFor(root).join
@@ -212,7 +228,7 @@ export async function runMatch(options) {
   // 1. 取歌单
   if (isCancelled()) return cancelled()
   const fetched = await runScript('fetch-netease-playlist.js', [playlistUrl, j(work, 'pl.json')], {
-    env, root, spawnImpl, onLine,
+    env, root, spawnImpl, onLine, onChild,
   })
   if (fetched.code !== 0) throw new Error(`取歌单失败（退出码 ${fetched.code}）：${tail(fetched.stderr)}`)
 
@@ -225,7 +241,7 @@ export async function runMatch(options) {
   if (tokenNeedsRefresh(token, now())) {
     append('取 Apple 目录 token…')
     const tok = await runScript('get-am-token.js', ['--storefronts', String(config.storefronts ?? 'jp,cn,hk')], {
-      env, root, spawnImpl, onLine,
+      env, root, spawnImpl, onLine, onChild,
     })
     if (tok.code !== 0) {
       throw new Error(
@@ -243,21 +259,32 @@ export async function runMatch(options) {
     '--storefronts', String(config.storefronts ?? 'jp,cn,hk'),
     '--min-interval', '900',
     '--concurrency', '2',
-  ], { env, root, spawnImpl, onLine })
+  ], { env, root, spawnImpl, onLine, onChild })
   if (matched.code !== 0) throw new Error(`匹配失败（退出码 ${matched.code}）：${tail(matched.stderr)}`)
 
   // 4. 换籍。`--out` 决定产物名：<work>/pl-download-cn.json —— Task 12 按这个名字读
-  if (isCancelled()) return cancelled()
   const reportIn = j(work, 'pl-match-report.json')
   const resolvedOut = j(work, 'pl-download-cn.json')
+  const report = JSON.parse(await readFile(reportIn, 'utf8'))
+
+  // 一个 A/B 都没有时不跑换籍：resolve-downloadable 会打印"没有可下载的命中"并 exit 2，
+  // 那样四档统计全丢、契约文件也不生成，模型分不清"只是没匹配到"还是"脚本坏了"。
+  // 空清单是正常结果，写一份空 JSON 让 Task 12 拿到确定的"没有可下的"。
+  const hasHits = report.some((r) => DOWNLOAD_TIERS.has(r?.verdict))
+  if (!hasHits) {
+    await writeFile(resolvedOut, '[]\n', 'utf8')
+    append('没有可下载的命中（A/B 档为 0），已写出空的 pl-download-cn.json')
+    return { ...summarize(report, []), workDir: work, reportPath: resolvedOut }
+  }
+
+  if (isCancelled()) return cancelled()
   const resolvedStep = await runScript('resolve-downloadable.js', [reportIn, '--out', j(work, 'pl')], {
-    env, root, spawnImpl, onLine,
+    env, root, spawnImpl, onLine, onChild,
   })
   if (resolvedStep.code !== 0) {
     throw new Error(`换籍失败（退出码 ${resolvedStep.code}）：${tail(resolvedStep.stderr)}`)
   }
 
-  const report = JSON.parse(await readFile(reportIn, 'utf8'))
   const resolved = JSON.parse(await readFile(resolvedOut, 'utf8'))
   return { ...summarize(report, resolved), workDir: work, reportPath: resolvedOut }
 }

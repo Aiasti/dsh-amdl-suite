@@ -67,6 +67,9 @@ export function registerDownloadTool(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.summary }],
     },
     async execute(args, exec) {
+      if (ctx.jobs === undefined || ctx.jobs === null) {
+        throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
+      }
       const mode = detectMode(args)
       const root = rootFor(config)
       const urls = mode === 'playlist'

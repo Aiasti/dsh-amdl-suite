@@ -44,6 +44,9 @@ export function registerMatchTool(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.summary }],
     },
     execute(args, exec) {
+      if (ctx.jobs === undefined || ctx.jobs === null) {
+        throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
+      }
       const root = rootFor(config)
       const workDir = workDirFor(root, playlistIdOf(args.playlistUrl))
       const owner = exec?.agent?.id
@@ -59,6 +62,10 @@ export function registerMatchTool(ctx, config = {}) {
         work: async ({ append, isCancelled }) => {
           try {
             const r = await runMatch({ playlistUrl: args.playlistUrl, root, config, append, isCancelled })
+            if (r.cancelled === true) {
+              append('已取消：未跑完的步骤没有产物')
+              return '已取消'
+            }
             append(
               `匹配完成：可下载 ${r.download} / 需复核 ${r.review} / 未找到 ${r.notFound}`
                 + ` / 请求失败 ${r.retry} / 账号区无资产 ${r.accountMissing}`,
