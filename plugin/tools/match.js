@@ -4,7 +4,7 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { startJob } from '../lib/job.js'
-import { playlistIdOf, runMatch } from '../lib/match.js'
+import { matchWork, playlistIdOf } from '../lib/match.js'
 import { workDirFor } from '../lib/paths.js'
 import { rootFor } from '../lib/setup.js'
 
@@ -22,7 +22,8 @@ export function registerMatchTool(ctx, config = {}) {
       + 'pl-download-cn.json (machine-readable, has url/duplicate), pl-cn-report.md (human), '
       + 'pl-download-cn.txt (URLs). Tiers A-name and B-duration+album are directly downloadable; '
       + 'C-* need review; D-no not found; retry means the query failed. Tracks with no account-region '
-      + 'asset are reported separately and never counted as "not found".',
+      + 'asset are reported separately and never counted as "not found". A playlist whose tracks are '
+      + 'all C/D is a normal result: it writes an empty downloadable list instead of failing.',
     parameters: {
       playlistUrl: {
         type: 'string',
@@ -57,26 +58,9 @@ export function registerMatchTool(ctx, config = {}) {
         toolCall: exec?.toolCall,
         kind: 'amdl-match',
         label: `匹配歌单 ${args.playlistUrl}`,
-        // 抛出而不是返回 {error}：注册表把 done 的 reject 结算成 `failed`，
-        // 返回对象只会得到一个显示为 `completed` 的失败 job。
-        work: async ({ append, isCancelled }) => {
-          try {
-            const r = await runMatch({ playlistUrl: args.playlistUrl, root, config, append, isCancelled })
-            if (r.cancelled === true) {
-              append('已取消：未跑完的步骤没有产物')
-              return '已取消'
-            }
-            append(
-              `匹配完成：可下载 ${r.download} / 需复核 ${r.review} / 未找到 ${r.notFound}`
-                + ` / 请求失败 ${r.retry} / 账号区无资产 ${r.accountMissing}`,
-            )
-            append(`产物：${r.reportPath}`)
-            return `匹配完成：可下载 ${r.download} / 需复核 ${r.review}`
-          } catch (err) {
-            append(`匹配失败：${err?.message ?? err}`)
-            throw err
-          }
-        },
+        // work 在 lib 里组装：`registerCancel` 必须透传，否则 job_kill 只置标志，
+        // 正在跑的 vendor 脚本会继续写同一个 workDir（design §6.7）。
+        work: matchWork({ playlistUrl: args.playlistUrl, root, config }),
       })
 
       return {

@@ -208,8 +208,13 @@ export async function runMatch(options) {
   // 只"步骤之间检查"等于 job 显示 killed 而脚本仍在写同一目录（design §6.7）。
   let current = null
   registerCancel(() => {
-    const pid = current?.pid
-    if (Number.isInteger(pid)) kill(pid)
+    const proc = current
+    const pid = proc?.pid
+    if (!Number.isInteger(pid)) return
+    kill(pid)
+    // taskkill 失败（权限、进程已退出）时兜底直接杀子进程，保证 'close' 一定会来；
+    // 否则 Promise 会一直挂在那个子进程上。
+    try { proc.kill?.() } catch { /* 已退出 */ }
   })
   const onChild = (proc) => { current = proc }
 
@@ -230,6 +235,8 @@ export async function runMatch(options) {
   const fetched = await runScript('fetch-netease-playlist.js', [playlistUrl, j(work, 'pl.json')], {
     env, root, spawnImpl, onLine, onChild,
   })
+  // 被杀掉的子进程退出码非 0；取消不该被报成"取歌单失败"
+  if (isCancelled()) return cancelled()
   if (fetched.code !== 0) throw new Error(`取歌单失败（退出码 ${fetched.code}）：${tail(fetched.stderr)}`)
 
   // 2. Apple 目录 token（缺失/24h 内过期才重取）
@@ -243,6 +250,7 @@ export async function runMatch(options) {
     const tok = await runScript('get-am-token.js', ['--storefronts', String(config.storefronts ?? 'jp,cn,hk')], {
       env, root, spawnImpl, onLine, onChild,
     })
+    if (isCancelled()) return cancelled()
     if (tok.code !== 0) {
       throw new Error(
         `取 Apple token 失败（退出码 ${tok.code}）：${tail(tok.stderr)}。`
@@ -260,6 +268,7 @@ export async function runMatch(options) {
     '--min-interval', '900',
     '--concurrency', '2',
   ], { env, root, spawnImpl, onLine, onChild })
+  if (isCancelled()) return cancelled()
   if (matched.code !== 0) throw new Error(`匹配失败（退出码 ${matched.code}）：${tail(matched.stderr)}`)
 
   // 4. 换籍。`--out` 决定产物名：<work>/pl-download-cn.json —— Task 12 按这个名字读
@@ -281,6 +290,7 @@ export async function runMatch(options) {
   const resolvedStep = await runScript('resolve-downloadable.js', [reportIn, '--out', j(work, 'pl')], {
     env, root, spawnImpl, onLine, onChild,
   })
+  if (isCancelled()) return cancelled()
   if (resolvedStep.code !== 0) {
     throw new Error(`换籍失败（退出码 ${resolvedStep.code}）：${tail(resolvedStep.stderr)}`)
   }
@@ -292,4 +302,37 @@ export async function runMatch(options) {
 const tail = (text) => {
   const lines = String(text ?? '').trim().split('\n').filter(Boolean)
   return lines.slice(-5).join(' / ') || '(无输出)'
+}
+
+/**
+ * 把 job 的上下文接到 `runMatch` 上，返回 `jobs.start({ run }).run` 里那个 `work`。
+ *
+ * 放在 lib 而不是 tools 里，是因为 `tools/*.js` 依赖宿主包、纯 Node 下 import 不到，
+ * 接线（尤其是 `registerCancel` 必须透传）就无法被测试真实覆盖 —— 上一轮正是漏传它，
+ * lib 层修好了而生产路径仍然不杀进程。
+ *
+ * @param {{ playlistUrl: string, root: string, config?: Record<string, unknown> }} options
+ */
+export function matchWork({ playlistUrl, root, config = {} }) {
+  return async (ctx = {}) => {
+    const {
+      append = () => {}, isCancelled = () => false, registerCancel = () => {},
+    } = ctx
+    try {
+      const r = await runMatch({ playlistUrl, root, config, append, isCancelled, registerCancel })
+      if (r.cancelled === true) {
+        append('已取消：未跑完的步骤没有产物')
+        return '已取消'
+      }
+      append(
+        `匹配完成：可下载 ${r.download} / 需复核 ${r.review} / 未找到 ${r.notFound}`
+          + ` / 请求失败 ${r.retry} / 账号区无资产 ${r.accountMissing}`,
+      )
+      append(`产物：${r.reportPath}`)
+      return `匹配完成：可下载 ${r.download} / 需复核 ${r.review}`
+    } catch (err) {
+      append(`匹配失败：${err?.message ?? err}`)
+      throw err
+    }
+  }
 }
