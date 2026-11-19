@@ -1,4 +1,5 @@
 import { Config } from './lib/config-schema.js'
+import { registerDownloadTool } from './tools/download.js'
 import { registerMatchTool } from './tools/match.js'
 import { registerSetupTool } from './tools/setup.js'
 
@@ -9,4 +10,5 @@ export { Config }
 export function apply(ctx, config) {
   registerSetupTool(ctx, config)
   registerMatchTool(ctx, config)
+  registerDownloadTool(ctx, config)
 }
