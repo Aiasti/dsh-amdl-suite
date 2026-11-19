@@ -9,8 +9,8 @@ pnpm-lock.yaml
 docs/
 
 # 测试与测试替身：只在本地保留，不公开
-plugin/test/
-plugin/test-support/
+test/
+test-support/
 
 # 内部工作区（SDD 台账、评审包、证据日志）
 .superpowers/

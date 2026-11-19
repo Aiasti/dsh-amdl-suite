@@ -26,20 +26,23 @@
 
 ## 安装
 
-插件以 **bundle** 形式装进 DSH profile。**不要用 `link:` 安装** —— link 的真实路径在 profile 之外，宿主的模块解析层覆盖不到 `@deepseek-ai/*`，插件会加载失败。
-
-```powershell
-cd plugin
-npm pack --pack-destination ..\dist
-```
-
-然后在 DSH 里用 `plugin_manager`：
+插件以 **bundle** 形式装进 DSH profile，直接从这个仓库装：
 
 ```
-install_bundle  target = <仓库>\dist\dsh-amdl-suite-1.0.0.tgz
+plugin_manager → install_bundle
+target = https://github.com/Aiasti/dsh-amdl-suite
 ```
 
 装好后重启 DSH，三个工具就出现在模型侧。
+
+本地改代码后要装自己那份：
+
+```powershell
+npm pack --pack-destination dist
+# 然后 install_bundle target = <仓库>\dist\dsh-amdl-suite-1.0.0.tgz
+```
+
+> **不要用 `link:` 安装** —— link 的真实路径在 profile 之外，宿主的模块解析层覆盖不到 `@deepseek-ai/*`，插件会加载失败。也不要把 bundle 放进子目录：DSH 从仓库根读 `package.json` 的 `dsh.bundle.patch`。
 
 ## 用法
 
@@ -119,9 +122,9 @@ dsh-amdl-suite/
 
 分层规则（测试要在纯 Node 下能跑，所以逻辑必须与宿主解耦）：
 
-- `plugin/lib/*.js` —— 纯逻辑，只能 import `node:*` 与同目录 `lib/`
-- `plugin/tools/*.js` —— 薄接线，`import { defineTool } from '@deepseek-ai/dsh-tools'`
-- `plugin/lib/config-schema.js` —— 唯一允许 import 宿主包的 lib 文件，**不得被测试 import**
+- `lib/*.js` —— 纯逻辑，只能 import `node:*` 与同目录 `lib/`
+- `tools/*.js` —— 薄接线，`import { defineTool } from '@deepseek-ai/dsh-tools'`
+- `lib/config-schema.js` —— 唯一允许 import 宿主包的 lib 文件，**不得被测试 import**
 
 ## 已知限制
 
@@ -134,4 +137,4 @@ dsh-amdl-suite/
 
 MIT，见 [LICENSE](LICENSE)。
 
-运行时下载的两个上游项目同样是 MIT。`plugin/vendor/` 下的匹配/取数脚本为作者自研，随本仓库一同授权。
+运行时下载的两个上游项目同样是 MIT。`vendor/` 下的匹配/取数脚本为作者自研，随本仓库一同授权。
