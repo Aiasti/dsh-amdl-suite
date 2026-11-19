@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Apple Music 下载",
-    "description": "把网易云歌单或 Apple Music 链接下载为本地 ALAC 文件，含跨区匹配与音质校验。"
+    "title": "amdl套件",
+    "description": "把歌单里的曲目对齐到你的音乐库：跨区检索、同名判定、去重与音质复核。"
   }
 }
