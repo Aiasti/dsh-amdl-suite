@@ -41,7 +41,7 @@ target = https://github.com/Aiasti/dsh-amdl-suite
 
 ```powershell
 npm pack --pack-destination dist
-# 然后 install_bundle target = <仓库>\dist\dsh-amdl-suite-1.0.2.tgz
+# 然后 install_bundle target = <仓库>\dist\dsh-amdl-suite-1.0.3.tgz
 ```
 
 > **不要用 `link:` 安装** —— link 的真实路径在 profile 之外，宿主的模块解析层覆盖不到 `@deepseek-ai/*`，插件会加载失败。也不要把 bundle 放进子目录：DSH 从仓库根读 `package.json` 的 `dsh.bundle.patch`。
@@ -142,3 +142,4 @@ dsh-amdl-suite/
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。运行时下载的两个上游项目同样是 MIT。`vendor/` 下的匹配/取数脚本为作者自研，随本仓库一同授权。
+

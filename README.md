@@ -41,7 +41,7 @@ To install your local build:
 
 ```powershell
 npm pack --pack-destination dist
-# then install_bundle target = <repo>\dist\dsh-amdl-suite-1.0.2.tgz
+# then install_bundle target = <repo>\dist\dsh-amdl-suite-1.0.3.tgz
 ```
 
 > Do **not** install with `link:`: the real path lives outside the profile, the host resolver cannot see `@deepseek-ai/*`, and the plugin fails to load. Do not put the bundle in a subdirectory either: DSH reads `dsh.bundle.patch` from the repository root.
@@ -140,3 +140,4 @@ Set these in the DSH plugin config (all optional):
 ## License
 
 MIT. See [LICENSE](LICENSE). The two upstream projects used at runtime are MIT too. The matching/fetch scripts under `vendor/` are original work and are licensed with this repository.
+

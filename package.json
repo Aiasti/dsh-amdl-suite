@@ -1,6 +1,6 @@
 {
   "name": "dsh-amdl-suite",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "description": "Download NetEase playlists or Apple Music links as local ALAC files through amdl and wrapper-lite.",
