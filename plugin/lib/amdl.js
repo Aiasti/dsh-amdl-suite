@@ -69,7 +69,8 @@ export function parseJsonSummary(line) {
  * `verdict` 取值：`ok` | `key500` | `aac` | `exists` | `unknown`（来自 `classify`），
  * 外加本函数产生的 `timeout`（超时）与 `cancelled`（`signal` 中止），这两种 `path` 均为 `null`。
  *
- * 超时或中止时只 `proc.kill()` 直接子进程——`taskkill /T` 清理进程树是 Task 12 的事。
+ * 超时或中止时优先调 `killTree(pid)` 清理**进程树**（design §6.7：只杀直接子进程会留下
+ * amdl 派生的子进程）；没给 `killTree` 时退回 `proc.kill()`。
  *
  * @param {{
  *   amdlPath: string,
@@ -79,11 +80,12 @@ export function parseJsonSummary(line) {
  *   onLine?: (line: string, parsed: { kind: string, percent?: number } | null) => void,
  *   timeoutMs?: number,
  *   signal?: AbortSignal,
+ *   killTree?: (pid: number) => void,
  * }} options
  * @returns {Promise<{ url: string, path: string | null, verdict: string, log: string, exitCode: number }>}
  */
 export function downloadOne(options) {
-  const { amdlPath, configPath, url, onLine, timeoutMs, signal } = options
+  const { amdlPath, configPath, url, onLine, timeoutMs, signal, killTree } = options
   const spawnImpl = options.spawnImpl ?? spawn
 
   return new Promise((resolve, reject) => {
@@ -145,10 +147,20 @@ export function downloadOne(options) {
       resolve({ url, path, verdict, log, exitCode: closeCode })
     }
 
-    // 只杀自己 spawn 的子进程；进程树清理（taskkill /T）是 Task 12 的事。
+    // 停进程树：给了 killTree 就按 pid 走（Windows 用 taskkill /T），否则退化成杀直接子进程。
+    const killNow = () => {
+      const pid = proc.pid
+      if (typeof killTree === 'function' && Number.isInteger(pid)) {
+        try { killTree(pid) } catch { /* 清理失败不能让 Promise 挂住 */ }
+        return
+      }
+      proc.kill?.()
+    }
+
+    // 只杀自己 spawn 的子进程；进程树清理（taskkill /T）由调用方通过 killTree 提供。
     const onAbort = () => {
       forced = 'cancelled'
-      proc.kill?.()
+      killNow()
       settle()
     }
 
@@ -169,7 +181,7 @@ export function downloadOne(options) {
     if (timeoutMs !== undefined && timeoutMs !== null) {
       timer = setTimeout(() => {
         forced = 'timeout'
-        proc.kill?.()
+        killNow()
         settle()
       }, timeoutMs)
     }

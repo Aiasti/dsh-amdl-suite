@@ -25,6 +25,24 @@ const VENDOR = fileURLToPath(new URL('../vendor/', import.meta.url))
 const PORT = 12340
 
 /**
+ * 杀掉 amdl 的**进程树**（design §6.7）。
+ *
+ * `proc.kill()` 只结束直接子进程；amdl 派生的子进程会活下来，会话关掉后仍在跑。
+ * Windows 用 `taskkill /T /F`，其它平台退化成按 pid 直接杀（第一版只做 Windows）。
+ */
+function killTree(pid) {
+  if (!Number.isInteger(pid)) return
+  if (process.platform === 'win32') {
+    const proc = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true })
+    // 进程已退出时 taskkill 返回非零；不接住异步 'error' 会变成未捕获异常崩宿主
+    proc.on?.('error', () => {})
+    proc.unref?.()
+    return
+  }
+  try { process.kill(pid, 'SIGKILL') } catch { /* 已退出 */ }
+}
+
+/**
  * 判定输入模式。两个都给或都不给都算用法错误——不要"猜一个"。
  *
  * @param {{ workDir?: string, urls?: string[] }} args
@@ -256,6 +274,7 @@ export async function runDownloads(options) {
   const ensure = deps.ensureEngine ?? ensureEngine
   const stop = deps.stopEngine ?? stopEngine
   const one = deps.downloadOne ?? downloadOne
+  const kill = deps.killTree ?? killTree
   const verify = deps.verifyAlac ?? ((dir) => verifyAlac(dir, { spawnImpl, root }))
 
   const base = { mode, outputDir, engineDir, amdlPath, urls: urls.length }
@@ -320,6 +339,7 @@ export async function runDownloads(options) {
         configPath: cfgPath,
         url: item.url,
         signal: controller.signal,
+        killTree: kill,
         onLine: (line) => {
           if (String(line).trim() === '') return
           stall.touch()
