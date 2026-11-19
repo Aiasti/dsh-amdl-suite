@@ -115,12 +115,9 @@ dsh-amdl-suite/
 
 ## 开发
 
-```powershell
-cd plugin
-node --test          # 155 个用例
-```
+> 单元测试与内部设计文档**不随仓库发布**（作者本地保留）。下面的分层规则仍然适用于改动代码。
 
-分层规则（测试要在纯 Node 下能跑）：
+分层规则（测试要在纯 Node 下能跑，所以逻辑必须与宿主解耦）：
 
 - `plugin/lib/*.js` —— 纯逻辑，只能 import `node:*` 与同目录 `lib/`
 - `plugin/tools/*.js` —— 薄接线，`import { defineTool } from '@deepseek-ai/dsh-tools'`
