@@ -366,6 +366,30 @@ async function fetchEngineAction({ root, platform, d, config }) {
   }
 
   return withLock(root, async (preempted) => {
+    const engineItemsOf = (verified) => verified.items.filter((item) => isInside(productDir, item.path))
+    const dataImg = j(productDir, 'qemu', 'data.img')
+
+    // 已经装好就直接返回，**绝不重新解压**：
+    // zip 里带着一份全新的空 `qemu/data.img`，tar 覆盖它等于把用户的 Apple 登录态抹掉。
+    // 这条比"重装一次更干净"重要得多 —— data.img 丢了要用户重新登录（含 2FA）。
+    if (await exists(productDir)) {
+      const now = await d.verify(root, { platform })
+      const present = engineItemsOf(now)
+      if (present.length > 0 && present.every((item) => item.problem === undefined)) {
+        return {
+          action: 'fetch-engine',
+          ok: true,
+          items: present,
+          summary: [
+            `引擎已就绪，未重新解压（避免覆盖 data.img 里的登录态）：${productDir}`,
+            `版本：run_id ${runId}，资产 ${ENGINE_ARTIFACT}`,
+            `校验：引擎四个关键文件齐全（${present.length} / ${now.items.length} 项通过；amdl 由 fetch-amdl 负责）`,
+            ...lockNote(preempted),
+          ].join('\n'),
+        }
+      }
+    }
+
     let reusedZip = false
     if ((await exists(zipPath)) && sha256Match(want, await d.sha256OfFile(zipPath))) {
       reusedZip = true
@@ -383,20 +407,48 @@ async function fetchEngineAction({ root, platform, d, config }) {
     }
 
     await mkdir(productDir, { recursive: true })
-    // 旧版本可能把内容散落在 <root>/engine 下（历史 bug 的解压位置），先清掉避免两套树并存
-    for (const stale of ['wrapper-lite-qemu.exe', 'qemu', 'LICENSE', 'README.md']) {
-      await rm(j(engineRoot, stale), { recursive: true, force: true })
+
+    // 解压前把现有的 data.img（登录态）挪开，解压后原样放回。
+    // zip 里那份是全新的空镜像，覆盖 = 用户必须重新登录。
+    let preservedDataImg = null
+    if (await exists(dataImg)) {
+      const st = await stat(dataImg)
+      if (st.size > 0) {
+        preservedDataImg = `${dataImg}.keep`
+        await rename(dataImg, preservedDataImg)
+      }
     }
+
+    // 旧版本可能把内容散落在 <root>/engine 下（历史 bug 的解压位置），清掉避免两套树并存。
+    // 但若那里还有非空的 data.img，说明是用户真实的登录态，不能删 —— 只提示。
+    const legacyKept = []
+    for (const stale of ['wrapper-lite-qemu.exe', 'qemu', 'LICENSE', 'README.md']) {
+      const target = j(engineRoot, stale)
+      if (!(await exists(target))) continue
+      if (stale === 'qemu') {
+        const legacyImg = j(target, 'data.img')
+        if ((await exists(legacyImg)) && (await stat(legacyImg)).size > 0) {
+          legacyKept.push(target)
+          continue
+        }
+      }
+      await rm(target, { recursive: true, force: true })
+    }
+
     try {
       // 参数数组，不拼 shell 字符串：路径含空格/中文时拼串会炸
       await run('tar', ['-xf', zipPath, '-C', productDir], { windowsHide: true })
     } catch (err) {
+      // 解压失败也要把登录态放回去，否则用户既没装成引擎、又丢了登录
+      if (preservedDataImg !== null) await rename(preservedDataImg, dataImg).catch(() => {})
       const detail = String(err?.stderr ?? err?.message ?? err).trim()
       throw new Error(
         `解压失败（tar -xf "${zipPath}" -C "${productDir}"）：${detail}。`
           + 'Windows 10/11 自带 tar.exe；若缺失请安装 bsdtar，或手动把该 zip 解压到上述目录',
       )
     }
+
+    if (preservedDataImg !== null) await rename(preservedDataImg, dataImg)
 
     const verified = await d.verify(root, { platform })
     // `verify` 恒返回 5 项（引擎 4 文件 + amdl），而本 action 只负责引擎：
@@ -420,9 +472,13 @@ async function fetchEngineAction({ root, platform, d, config }) {
           : `引擎已下载并通过校验：${zipPath}（${ENGINE_BYTES.toLocaleString('en-US')} B）`,
         `版本：run_id ${runId}，资产 ${ENGINE_ARTIFACT}`,
         `解压到：${productDir}（zip 保留，便于重解压）`,
+        preservedDataImg !== null
+          ? '登录态已保留：解压时先把 data.img 挪开，解压后原样放回（zip 里那份是空镜像）'
+          : '',
+        ...legacyKept.map((dir) => `保留了旧布局里的 ${dir}：里面有非空的 data.img（登录态），未删除`),
         `校验：引擎四个关键文件齐全（${engineItems.length} / ${verified.items.length} 项通过；amdl 由 fetch-amdl 负责）`,
         ...lockNote(preempted),
-      ].join('\n'),
+      ].filter((line) => line !== '').join('\n'),
     }
   })
 }

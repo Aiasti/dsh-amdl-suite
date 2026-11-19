@@ -1,11 +1,14 @@
 import http from 'node:http'
 import path from 'node:path'
 import { closeSync, mkdirSync, openSync } from 'node:fs'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { execFile, spawn } from 'node:child_process'
 
 const DEFAULT_WAIT_MS = 180000
 const DEFAULT_POLL_MS = 2000
 const STATUS_TIMEOUT_MS = 2000
+/** 锁超过这个时长视为崩溃遗留（design §6.8 与 setup 锁同口径）。 */
+const LOCK_TTL_MS = 30 * 60 * 1000
 
 /** 第一版只实现 Windows；差异收在这张表里，其余平台明确拒绝而不是猜参数。 */
 const LAUNCHERS = { win32: 'wrapper-lite-qemu.exe' }
@@ -13,6 +16,68 @@ const LAUNCHERS = { win32: 'wrapper-lite-qemu.exe' }
 const joinFor = (root) => (String(root).includes('\\') ? path.win32 : path.posix)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** pid 还在不在。EPERM 说明进程存在但不是我们的。 */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid)) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err?.code === 'EPERM'
+  }
+}
+
+/** 读锁文件；损坏或不存在返回 `null`。 */
+async function readLock(lockPath) {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, 'utf8'))
+    return parsed !== null && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 抢引擎启动锁（design §6.8：粒度是引擎端口，`<状态目录>/.engine.lock`）。
+ *
+ * 抢不到**不是错误** —— 说明另一个会话正在拉起引擎，我们等它就绪后复用即可。
+ * 只有"崩溃遗留锁"（持有者 pid 已消失，或超过 30 分钟）才抢占：
+ * 用 `rename` 原子搬走再 `wx`，不会把别人刚建好的锁删掉。
+ *
+ * @returns {Promise<{ acquired: boolean, holder?: object, release?: () => Promise<void> }>}
+ */
+export async function acquireEngineLock(lockPath, options = {}) {
+  const now = options.now ?? Date.now
+  await mkdir(path.dirname(lockPath), { recursive: true })
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid, at: now() }), { flag: 'wx' })
+      return { acquired: true, release: async () => { await rm(lockPath, { force: true }) } }
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err
+
+      const holder = await readLock(lockPath)
+      const stale = holder === null
+        || !pidAlive(holder.pid)
+        || now() - Number(holder.at ?? 0) > LOCK_TTL_MS
+      if (!stale) return { acquired: false, holder }
+
+      const grave = `${lockPath}.stale-${process.pid}`
+      try {
+        await rename(lockPath, grave)
+      } catch (e) {
+        // 别人抢先搬走了：回到循环重新抢，绝不盲删
+        if (e?.code === 'ENOENT') continue
+        throw e
+      }
+      await rm(grave, { force: true }).catch(() => {})
+    }
+  }
+
+  return { acquired: false, holder: await readLock(lockPath) }
+}
 
 /**
  * 启动器参数。第一版只支持 Windows（与 `Start-WrapperLite.ps1` 一致）。
@@ -92,6 +157,43 @@ export async function ensureEngine(options) {
     return { pid: null, regions: first.regions, reused: true }
   }
 
+  const jl = joinFor(engineDir).join
+  // 锁放状态根目录：engineDir 是 <root>/engine/wrapper-lite-qemu，往上两层即 <root>
+  const lockPath = options.lockPath ?? jl(jl(engineDir, '..', '..'), '.engine.lock')
+  // 锁拿不到不该挡住启动（例如自定义 engineDir 推到了盘根、或目录只读）：
+  // 退化成"无锁单跑"，并用 summary 之外的方式暴露在错误文案里。
+  let lock = { acquired: true, release: async () => {} }
+  try {
+    lock = await acquireEngineLock(lockPath)
+  } catch { /* 降级：本次不持锁 */ }
+
+  if (!lock.acquired) {
+    // 别的会话正在拉起引擎：等它起来后复用，**绝不重复 spawn**（两个进程会抢 12340，
+    // 而且先完成的会话会把另一个正在用的引擎停掉）。
+    const holder = lock.holder ?? await readLock(lockPath)
+    const deadline = Date.now() + waitMs
+    while (Date.now() < deadline) {
+      await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())))
+      const status = await statusOf(port, { fetchImpl })
+      if (status !== null && status.code === 0) {
+        return { pid: null, regions: status.regions, reused: true }
+      }
+    }
+    throw new Error(
+      `另一个会话正在启动引擎（锁 ${lockPath}，持有者 pid ${holder?.pid ?? '未知'}），`
+        + `${waitMs}ms 内没等到它就绪。请稍等重试；若确认对方已崩溃，删掉该锁文件即可。`,
+    )
+  }
+
+  try {
+    return await startEngine({ engineDir, port, platform, waitMs, pollMs, fetchImpl, spawnImpl, options })
+  } finally {
+    await lock.release()
+  }
+}
+
+/** 真正拉起引擎并等就绪；调用方保证持锁。 */
+async function startEngine({ engineDir, port, platform, waitMs, pollMs, fetchImpl, spawnImpl, options }) {
   const j = joinFor(engineDir).join
   const logFile = j(engineDir, 'logs', `engine-${stamp()}.log`)
   const exe = launcherPathFor(engineDir, platform)
@@ -115,8 +217,22 @@ export async function ensureEngine(options) {
   // 启动器起不来时 `defaultSpawn` 把错误记在 `child.spawnError`（异步 'error' 事件，
   // 到这里通常已经落定）；拼进超时文案，让"目录错一层"这类问题一眼可见。
   const reason = child?.spawnError ? `；启动失败：${child.spawnError.message}` : ''
+
+  // 超时必须回收自己拉起的那个进程树：否则它会一直占着端口与 512 MB 内存，
+  // 而调用方手里没有 pid（ensure 是抛错返回的），永远清不掉。
+  const killImpl = options.killImpl ?? stopEngine
+  let killed = ''
+  if (Number.isInteger(pid) && child?.spawnError === undefined) {
+    try {
+      await killImpl(pid)
+      killed = `；已终止未就绪的进程 pid ${pid}`
+    } catch {
+      killed = `；终止进程 pid ${pid} 失败，请手动结束`
+    }
+  }
+
   throw new Error(
-    `引擎在 ${waitMs}ms 内未就绪（端口 ${port}）；日志：${logFile}；目录：${engineDir}${reason}`,
+    `引擎在 ${waitMs}ms 内未就绪（端口 ${port}）；日志：${logFile}；目录：${engineDir}${reason}${killed}`,
   )
 }
 

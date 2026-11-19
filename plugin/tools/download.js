@@ -24,7 +24,16 @@ async function urlsFromWorkDir(workDir) {
         + '请先跑 amdl_match，或改用 urls 参数直接给 Apple Music 链接。',
     )
   }
-  return urlsFromResolved(JSON.parse(text))
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`${file} 不是合法 JSON：${err?.message ?? err}。重跑 amdl_match 生成一份新的。`)
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${file} 的形状不对：期望数组，实得 ${parsed === null ? 'null' : typeof parsed}。`)
+  }
+  return urlsFromResolved(parsed)
 }
 
 export function registerDownloadTool(ctx, config = {}) {
@@ -77,8 +86,8 @@ export function registerDownloadTool(ctx, config = {}) {
         : args.urls.map((url, i) => ({ idx: i + 1, url: String(url) }))
 
       if (urls.length === 0) {
-        throw new Error('没有可下载的曲目：换籍结果里全部是"账号区无资产"或重复项。'
-          + '请先用 amdl_match 换籍，或直接用 urls 给 Apple Music 链接。')
+        throw new Error('没有可下载的曲目：清单是空的。可能是匹配 0 命中、全部为账号区无资产，'
+          + '或全部是重复项 —— 详见 workDir 里的 pl-cn-report.md；也可以直接用 urls 给 Apple Music 链接。')
       }
 
       const owner = exec?.agent?.id

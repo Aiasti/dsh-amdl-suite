@@ -152,6 +152,9 @@ export function downloadOne(options) {
       const pid = proc.pid
       if (typeof killTree === 'function' && Number.isInteger(pid)) {
         try { killTree(pid) } catch { /* 清理失败不能让 Promise 挂住 */ }
+        // taskkill 可能失败（权限、进程已退出）：再补一刀直接子进程，
+        // 否则 Promise 会一直挂在没有 'close' 的子进程上
+        try { proc.kill?.() } catch { /* 已退出 */ }
         return
       }
       proc.kill?.()

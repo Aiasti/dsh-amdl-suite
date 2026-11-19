@@ -68,6 +68,12 @@ export const startJob = ({ jobs, owner, toolCall, kind, label, work }) =>
       const done = Promise.resolve()
         .then(() => work({ append, isCancelled, registerCancel }))
         .then(outcomeOf)
+        // 被 kill 之后 work 往往以"进程被杀"的错误收场。那个错误不是失败，
+        // 不该让 job 显示 failed + 一条无关错误 —— 结算成 killed，与状态一致。
+        .catch((err) => {
+          if (cancelled) return { status: 'killed' }
+          throw err
+        })
         .finally(() => runCancel())
 
       return {

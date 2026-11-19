@@ -79,13 +79,17 @@ export function tokenNeedsRefresh(token, nowMs = Date.now(), marginMs = 24 * 60 
 }
 
 /**
- * 按四档 + 重试统计报告，并单列账号区无资产。
+ * 按四档 + 重试统计报告，并单列换籍后的真实可下载数。
  *
  * 四档之和恒等于 `report.length`：未知 verdict 归入 `notFound` 并在 `unknown` 里计数，
  * 避免"某档漏算"变成静默缺口。
  *
- * @param {Array<{ verdict?: string }>} report
- * @param {Array<{ url?: string }>} [resolved] `pl-download-cn.json` 的行
+ * **不要拿 `download`（A/B 命中数）当"能下几首"**：换籍后才知道账号区到底有没有资产
+ * （design §6.4.1 要求分「可下 X / 重复 Z / 国区无资产 Y / 共 N」四项，且不许混算）。
+ * 真实例子：A-name 命中 2 首，国区只有 1 首有资产 —— 报「可下载 2」就是系统性高估。
+ *
+ * @param {Array<{ verdict?: string }>} report 匹配报告（每首一行的判定）
+ * @param {Array<{ url?: string, duplicate?: boolean }>} [resolved] 换籍产物 `pl-download-cn.json`
  */
 export function summarize(report, resolved = []) {
   const s = { download: 0, review: 0, notFound: 0, retry: 0, unknown: 0, accountMissing: 0 }
@@ -97,7 +101,11 @@ export function summarize(report, resolved = []) {
     else if (v === 'D-no') s.notFound++
     else { s.notFound++; s.unknown++ }
   }
-  s.accountMissing = (Array.isArray(resolved) ? resolved : []).filter((r) => r?.url === '').length
+
+  const rows = Array.isArray(resolved) ? resolved : []
+  s.duplicate = rows.filter((r) => r?.duplicate === true).length
+  s.accountMissing = rows.filter((r) => r?.duplicate !== true && (r?.url ?? '') === '').length
+  s.downloadable = rows.filter((r) => r?.duplicate !== true && (r?.url ?? '') !== '').length
   return s
 }
 
@@ -274,7 +282,7 @@ export async function runMatch(options) {
   // 4. 换籍。`--out` 决定产物名：<work>/pl-download-cn.json —— Task 12 按这个名字读
   const reportIn = j(work, 'pl-match-report.json')
   const resolvedOut = j(work, 'pl-download-cn.json')
-  const report = JSON.parse(await readFile(reportIn, 'utf8'))
+  const report = await readJsonArray(reportIn, '匹配报告')
 
   // 一个 A/B 都没有时不跑换籍：resolve-downloadable 会打印"没有可下载的命中"并 exit 2，
   // 那样四档统计全丢、契约文件也不生成，模型分不清"只是没匹配到"还是"脚本坏了"。
@@ -295,8 +303,38 @@ export async function runMatch(options) {
     throw new Error(`换籍失败（退出码 ${resolvedStep.code}）：${tail(resolvedStep.stderr)}`)
   }
 
-  const resolved = JSON.parse(await readFile(resolvedOut, 'utf8'))
+  const resolved = await readJsonArray(resolvedOut, '换籍产物')
   return { ...summarize(report, resolved), workDir: work, reportPath: resolvedOut }
+}
+
+/**
+ * 读一个"必须是数组"的 JSON 产物。
+ *
+ * 裸 `JSON.parse(readFile())` 出错时只会得到 `ENOENT` 或 `Unexpected token`，
+ * 模型看不出是哪个阶段、哪个文件、下一步该做什么。
+ *
+ * @param {string} file
+ * @param {string} label 给人看的阶段名（如"匹配报告"）
+ */
+async function readJsonArray(file, label) {
+  let text
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (err) {
+    throw new Error(`读不到${label} ${file}：${err?.message ?? err}。`
+      + '上游脚本可能中途失败；看 job 输出里该脚本的 stderr。')
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (err) {
+    throw new Error(`${label} ${file} 不是合法 JSON：${err?.message ?? err}。`
+      + '多半是上游脚本写了一半就退出，可重跑本书单。')
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${label} ${file} 的形状不对：期望数组，实得 ${parsed === null ? 'null' : typeof parsed}。`)
+  }
+  return parsed
 }
 
 const tail = (text) => {
@@ -327,11 +365,12 @@ export function matchWork({ playlistUrl, root, config = {} }) {
         return '已取消'
       }
       append(
-        `匹配完成：可下载 ${r.download} / 需复核 ${r.review} / 未找到 ${r.notFound}`
-          + ` / 请求失败 ${r.retry} / 账号区无资产 ${r.accountMissing}`,
+        `匹配完成：可下 ${r.downloadable} / 重复 ${r.duplicate} / 国区无资产 ${r.accountMissing}`
+          + ` / 共 ${r.downloadable + r.duplicate + r.accountMissing}`
+          + `（匹配档位：A+B 命中 ${r.download} / 需复核 ${r.review} / 未找到 ${r.notFound} / 请求失败 ${r.retry}）`,
       )
       append(`产物：${r.reportPath}`)
-      return `匹配完成：可下载 ${r.download} / 需复核 ${r.review}`
+      return `匹配完成：可下 ${r.downloadable} / 重复 ${r.duplicate} / 国区无资产 ${r.accountMissing}`
     } catch (err) {
       append(`匹配失败：${err?.message ?? err}`)
       throw err

@@ -374,14 +374,19 @@ export async function runDownloads(options) {
       stall.stop()
     }
 
-    // 4. 收尾：只报告可疑项，绝不删除
-    const entries = await collectEntries(outputDir)
-    suspicious = findSuspicious(entries)
-    quality = await verify(outputDir)
+    // 4. 收尾：只报告可疑项，绝不删除。已取消时不再起新子进程去复核 ——
+    //    job 已经 killed，再 spawn 一个 verify 只会拖慢收尾并扫全量输出目录。
+    if (isCancelled()) {
+      append('已取消：跳过可疑项扫描与音质复核')
+    } else {
+      const entries = await collectEntries(outputDir)
+      suspicious = findSuspicious(entries)
+      quality = await verify(outputDir)
 
-    if (suspicious.length > 0) {
-      append(`可疑项 ${suspicious.length} 个（未删除，请自行确认）：`)
-      for (const s of suspicious) append(`  ${s.dir} —— ${s.reason}`)
+      if (suspicious.length > 0) {
+        append(`可疑项 ${suspicious.length} 个（未删除，请自行确认）：`)
+        for (const s of suspicious) append(`  ${s.dir} —— ${s.reason}`)
+      }
     }
   } finally {
     // 5. 停引擎：无论上面成功还是抛错，自己拉起的都要停掉
