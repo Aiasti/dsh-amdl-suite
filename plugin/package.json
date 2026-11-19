@@ -11,5 +11,13 @@
     "./icon": "./icon.svg"
   },
   "files": ["index.js", "cordis.patch.yml", "lib", "tools", "vendor", "locale", "icon.svg"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "capabilities": ["subprocess", "tools:register"]
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.0-0 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  }
 }
