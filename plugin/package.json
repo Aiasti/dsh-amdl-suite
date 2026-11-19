@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "description": "Download NetEase playlists or Apple Music links as local ALAC files through amdl and wrapper-lite.",
+  "license": "MIT",
+  "author": "Ai Astin",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
