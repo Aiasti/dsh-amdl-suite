@@ -320,7 +320,9 @@ export function matchWork({ playlistUrl, root, config = {} }) {
     } = ctx
     try {
       const r = await runMatch({ playlistUrl, root, config, append, isCancelled, registerCancel })
-      if (r.cancelled === true) {
+      // 取消可能落在收尾窗口里（例如刚读完报告、正要按成功返回）。job 的状态已经是
+      // killed，文案就必须跟着说是"已取消"，否则模型会照着成功文案继续下一步。
+      if (r.cancelled === true || isCancelled()) {
         append('已取消：未跑完的步骤没有产物')
         return '已取消'
       }
