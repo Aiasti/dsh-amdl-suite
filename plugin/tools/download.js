@@ -4,7 +4,7 @@
  */
 import { readFile } from 'node:fs/promises'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { detectMode, runDownloads, urlsFromResolved } from '../lib/download.js'
+import { detectMode, formatQuality, runDownloads, urlsFromResolved } from '../lib/download.js'
 import { startJob } from '../lib/job.js'
 import { rootFor } from '../lib/setup.js'
 
@@ -104,6 +104,9 @@ export function registerDownloadTool(ctx, config = {}) {
                 + `（超时 ${r.timeout}，取消 ${r.cancelled}）`,
             )
             append(`产物目录：${r.outputDir}`)
+            // 音质复核必须报给模型：下载成功不等于真无损（design §6.5 step 7）
+            const quality = formatQuality(r.verify)
+            if (quality !== '') append(quality)
             return `下载完成：成功 ${r.ok} / AAC ${r.aac} / 已存在 ${r.exists} / 失败 ${r.failed}`
           } catch (err) {
             append(`下载失败：${err?.message ?? err}`)

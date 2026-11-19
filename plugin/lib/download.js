@@ -148,6 +148,39 @@ export async function collectEntries(dir) {
 }
 
 /**
+ * 把 `verify-alac.js` 的结果压成一行给模型看（design §6.5 step 7 要求汇总里报音质）。
+ *
+ * 脚本两种输出形态：≤5 个文件时每行一个 JSON（有 `codec`/`bitDepth`/`sampleRate`），
+ * `>5` 时是汇总文本。两种都要能报，否则"下载成功"与"真的是无损"之间没有桥。
+ *
+ * @param {{ files?: object[], text?: string, error?: string }} [quality]
+ * @returns {string} 空字符串表示无可报内容
+ */
+export function formatQuality(quality) {
+  const q = quality ?? {}
+  if (typeof q.error === 'string' && q.error !== '') return `音质复核失败：${q.error}`
+
+  const files = Array.isArray(q.files) ? q.files : []
+  if (files.length > 0) {
+    const bad = files.filter((f) => String(f?.codec ?? '').toLowerCase() !== 'alac')
+    if (bad.length > 0) {
+      const names = bad.slice(0, 5).map((f) => String(f?.file ?? '?')).join('、')
+      return `音质复核：${files.length} 个文件，其中 ${bad.length} 个不是 ALAC（${names}）`
+    }
+    // 单曲时把位深/采样率直接报出来，多曲只报数量
+    if (files.length === 1) {
+      const f = files[0]
+      return `音质复核：${String(f?.file ?? '')} → ${f?.codec} ${f?.bitDepth} bit / ${f?.sampleRate} Hz，${f?.tier ?? ''}`.trim()
+    }
+    return `音质复核：${files.length} 个文件全部为 ALAC`
+  }
+
+  const text = typeof q.text === 'string' ? q.text.trim() : ''
+  if (text === '') return ''
+  return `音质复核：${text.split('\n').slice(-3).join(' / ')}`
+}
+
+/**
  * 跑 `verify-alac.js` 复核音质。
  *
  * 脚本输出两种形态：≤5 个文件时每行一个 JSON（含 `codec`），>5 个时是汇总文本。
