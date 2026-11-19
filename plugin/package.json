@@ -6,6 +6,7 @@
   "description": "Download NetEase playlists or Apple Music links as local ALAC files through amdl and wrapper-lite.",
   "exports": {
     ".": "./index.js",
+    "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
