@@ -104,10 +104,12 @@ export function registerDownloadTool(ctx, config = {}) {
                 + `（超时 ${r.timeout}，取消 ${r.cancelled}）`,
             )
             append(`产物目录：${r.outputDir}`)
-            // 音质复核必须报给模型：下载成功不等于真无损（design §6.5 step 7）
+            // 音质复核必须报给模型：下载成功不等于真无损（design §6.5 step 7）。
+            // 同时并进返回值 —— 模型能确定拿到的只有 `result`，ring 里的行不保证送达。
             const quality = formatQuality(r.verify)
             if (quality !== '') append(quality)
-            return `下载完成：成功 ${r.ok} / AAC ${r.aac} / 已存在 ${r.exists} / 失败 ${r.failed}`
+            const head = `下载完成：成功 ${r.ok} / AAC ${r.aac} / 已存在 ${r.exists} / 失败 ${r.failed}`
+            return quality === '' ? head : `${head}；${quality}`
           } catch (err) {
             append(`下载失败：${err?.message ?? err}`)
             throw err
