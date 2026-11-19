@@ -196,12 +196,14 @@ function parenParts(s) {
   }
   return out;
 }
-// 只有「中英混排」才拆文种：单一文种的曲名保持原逻辑，避免把「捉迷藏」这类短串拆坏
+// 只有「中英混排」才拆文种：单一文种的曲名保持原逻辑，避免把「捉迷藏」这类短串拆坏。
+// 但归一化段必须**总是**输出：`翦玉令·燕辞归` 与 `翦玉令燕辞归` 只差一个间隔符，
+// 旧实现只在 segs.length > 1 时输出，导致 Apple 侧单段 CJK 名永远比不上（2026-11-19）。
 function titleForms(s) {
   const full = clean(s);
   const out = [full, stripTitle(full)];
   const segs = segments(stripTitle(full));   // 括号里多是翻译/备注，拆文种前先去掉，避免拼出怪串
-  if (segs.length > 1) for (const g of segs) if (g.length >= 2) out.push(stripTitle(g));
+  for (const g of segs) if (g.length >= 2) out.push(stripTitle(g));
   for (const p of parenParts(full)) { out.push(p); out.push(stripTitle(p)); }
   return [...new Set(out.filter(Boolean))];
 }
@@ -249,11 +251,15 @@ function scorePair(qqName, qqArtist, apName, apArtist) {
 
 // 综合「名称 + 时长 + 专辑」给出分档。
 // 记住：时长单独不可信（钢琴翻奏版、同长不同曲都能撞上），必须配合曲名。
-function tierOf({ tScore, aScore, durDelta, albumSim }) {
+function tierOf({ tScore, aScore, durDelta, albumSim, versionMismatch }) {
   if (tScore >= 0.92 && aScore >= 0.6) return 'A-name';          // 可直接下载
   if (tScore >= 0.9 && durDelta != null && durDelta <= 1.5 && albumSim != null && albumSim >= 0.7) return 'B-duration+album';
   if (tScore >= 0.9 && durDelta != null && durDelta <= 3) return 'C-duration-only';  // 需人工过目
   if (tScore >= 0.9 && albumSim != null && albumSim >= 0.7) return 'C-album-only';
+  // 弱匹配兜底：歌手满分 + 时长接近 + 曲名过 0.7，只进复核，不自动下载。
+  // 必须排除版本标记（伴奏/翻唱），且时长必须已知。
+  if (aScore >= 0.9 && tScore >= 0.7 && durDelta != null && durDelta <= 1.5
+      && (versionMismatch === null || versionMismatch === undefined)) return 'C-artist-duration';
   return 'D-no';
 }
 const AUTO_DOWNLOAD_TIERS = new Set(['A-name', 'B-duration+album']);

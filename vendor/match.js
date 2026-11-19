@@ -111,26 +111,36 @@ async function processTrack(ne) {
         const durDelta = (ne.duration && at.durationInMillis) ? Math.abs(ne.duration - at.durationInMillis / 1000) : null;
         const albumSim = (ne.album && at.albumName) ? S.sim(ne.album, at.albumName) : null;
         const vm = S.versionMismatch(ne.name, at.name);
-        let tier = S.tierOf({ tScore: s.tScore, aScore: s.aScore, durDelta, albumSim });
+        let tier = S.tierOf({ tScore: s.tScore, aScore: s.aScore, durDelta, albumSim, versionMismatch: vm });
         // 版本不符（伴奏/卡拉OK/翻奏）不能算自动可下
         if (vm && (tier === 'A-name' || tier === 'B-duration+album')) tier = 'C-duration-only';
         const fullForm = S.clean(ne.name);
         const rec = { ...s, tier, durDelta, albumSim, versionMismatch: vm, id: c.id,
           name: at.name, artistName: at.artistName, albumName: at.albumName, url: at.url,
-          isrc: at.isrc, durationInMillis: at.durationInMillis, storefront: sf,
+          isrc: at.isrc, durationInMillis: at.durationInMillis, storefront: sf, storefronts: [sf],
           titleForm: detail.form, partialTitle: detail.form !== fullForm && detail.form !== S.stripTitle(fullForm) };
         const rank = t => S.RANK[t === 'A-name' ? 'exact' : t === 'B-duration+album' ? 'likely' : t === 'D-no' ? 'none' : 'ambiguous'];
         const better = !best || rank(tier) > rank(bestTier) || (tier === bestTier && rec.score > best.score);
         if (better) { best = rec; bestTier = tier; }
         const prev = pool.get(rec.id);
-        if (!prev || rec.score > prev.score) pool.set(rec.id, rec);
+        if (!prev) pool.set(rec.id, rec);
+        else {
+          // 同一 Apple id 跨区都存在时，保留分数更高的记录，但把区合并进 storefronts，
+          // 否则 jp 先搜到就会把 cn/hk 覆盖掉，报告看起来「只有日区」。
+          for (const s2 of rec.storefronts) if (!prev.storefronts.includes(s2)) prev.storefronts.push(s2);
+          if (rec.score > prev.score) { rec.storefronts = prev.storefronts; pool.set(rec.id, rec); }
+        }
+        if (best && best.id === rec.id) {
+          for (const s2 of rec.storefronts) if (!best.storefronts.includes(s2)) best.storefronts.push(s2);
+        }
       }
       if (bestTier === 'A-name' && !best?.partialTitle) break outer;   // 已确认，省下后续请求
     }
   }
   const status = (!anyOk && anyFail) ? 'retry' : bestTier;
   const candidates = [...pool.values()].sort((a, b) => b.score - a.score).slice(0, 5)
-    .map(c => ({ name: c.name, artistName: c.artistName, albumName: c.albumName, storefront: c.storefront,
+    .map(c => ({ id: c.id, name: c.name, artistName: c.artistName, albumName: c.albumName,
+      storefront: c.storefront, storefronts: c.storefronts,
       durDelta: c.durDelta, tScore: c.tScore, aScore: c.aScore, url: c.url }));
   return { idx: ne.idx, name: ne.name, artist: ne.artist, album: ne.album || '',
     duration: ne.duration || null, sid: ne.sid, verdict: status, best: bestTier === 'D-no' ? null : best, candidates };
@@ -146,10 +156,10 @@ function writeOutputs() {
   for (const r of results.slice().sort((a, b) => a.idx - b.idx)) {
     const b = r.best || {};
     rows.push([r.idx, r.name, r.artist, r.album, r.duration, r.sid, r.verdict, isAuto(r) ? 'YES' : 'NO', b.name || '', b.artistName || '',
-      b.albumName || '', b.storefront || '', b.durDelta != null ? b.durDelta.toFixed(1) : '',
+      b.albumName || '', (b.storefronts || [b.storefront || '']).join(','), b.durDelta != null ? b.durDelta.toFixed(1) : '',
       b.tScore != null ? b.tScore.toFixed(3) : '', b.aScore != null ? b.aScore.toFixed(3) : '',
       b.titleForm || '', b.partialTitle ? 'yes' : '', b.isrc || '', (b.url || ''),
-      (r.candidates || []).slice(0, 3).map(c => `${c.name} — ${c.artistName} [${c.storefront}]${c.durDelta != null ? ' Δ' + c.durDelta.toFixed(1) + 's' : ''}`).join(' / ')].map(q).join(','));
+      (r.candidates || []).slice(0, 3).map(c => `${c.name} — ${c.artistName} [${(c.storefronts || [c.storefront]).join(',')}]${c.durDelta != null ? ' Δ' + c.durDelta.toFixed(1) + 's' : ''}`).join(' / ')].map(q).join(','));
   }
   fs.writeFileSync(OUT_PREFIX + '-report.csv', '\uFEFF' + rows.join('\r\n'), 'utf8');
 
@@ -184,7 +194,7 @@ function writeOutputs() {
   const bySf = {};
   for (const r of auto) bySf[r.best.storefront] = (bySf[r.best.storefront] || 0) + 1;
   L.push('');
-  L.push('命中所属区：' + (Object.entries(bySf).map(([k, v]) => `${k} ${v}`).join('、') || '(无)'));
+  L.push('命中所属区（主区）：' + (Object.entries(bySf).map(([k, v]) => `${k} ${v}`).join('、') || '(无)'));
   const partial = auto.filter(r => r.best.partialTitle);
   if (partial.length) {
     L.push('');
@@ -205,7 +215,7 @@ function writeOutputs() {
   for (const r of auto.slice().sort((a, b) => a.idx - b.idx)) {
     const b = r.best;
     const warn = b.durDelta != null && b.durDelta > 3 ? ' ⚠' : '';
-    L.push(`| ${r.idx} | ${esc(r.name)} | ${esc(r.artist)} | ${esc(b.name)} | ${esc(b.artistName)} | ${esc(b.albumName)} | ${b.storefront} | ${b.durDelta != null ? b.durDelta.toFixed(1) + warn : ''} | ${b.partialTitle ? '拆段' : ''} | ${(b.url || '')} |`);
+    L.push(`| ${r.idx} | ${esc(r.name)} | ${esc(r.artist)} | ${esc(b.name)} | ${esc(b.artistName)} | ${esc(b.albumName)} | ${(b.storefronts || [b.storefront]).join(',')} | ${b.durDelta != null ? b.durDelta.toFixed(1) + warn : ''} | ${b.partialTitle ? '拆段' : ''} | ${(b.url || '')} |`);
   }
   L.push('');
   L.push(`## 需人工过目（${review.length}）`);
@@ -214,7 +224,7 @@ function writeOutputs() {
   L.push('|---|---|---|---|---|---|---|---|---|---|---|---|');
   for (const r of review.slice().sort((a, b) => a.idx - b.idx)) {
     const b = r.best;
-    L.push(`| ${r.idx} | ${esc(r.name)} | ${esc(r.artist)} | ${esc(b.name)} | ${esc(b.artistName)} | ${esc(b.albumName)} | ${r.verdict}${b.versionMismatch ? '(版本:' + b.versionMismatch + ')' : ''} | ${b.durDelta != null ? b.durDelta.toFixed(1) : ''} | ${b.tScore.toFixed(2)} | ${b.aScore.toFixed(2)} | ${b.storefront} | ${(b.url || '')} |`);
+    L.push(`| ${r.idx} | ${esc(r.name)} | ${esc(r.artist)} | ${esc(b.name)} | ${esc(b.artistName)} | ${esc(b.albumName)} | ${r.verdict}${b.versionMismatch ? '(版本:' + b.versionMismatch + ')' : ''} | ${b.durDelta != null ? b.durDelta.toFixed(1) : ''} | ${b.tScore.toFixed(2)} | ${b.aScore.toFixed(2)} | ${(b.storefronts || [b.storefront]).join(',')} | ${(b.url || '')} |`);
   }
   L.push('');
   L.push(`## 未找到（${none.length}）`);
@@ -225,7 +235,7 @@ function writeOutputs() {
   L.push('|---|---|---|---|---|');
   for (const r of none.slice().sort((a, b) => a.idx - b.idx)) {
     const alt = (r.candidates || []).slice(0, 3)
-      .map(c => `${esc(c.name)} — ${esc(c.artistName)} [${c.storefront}]${c.durDelta != null ? ' Δ' + c.durDelta.toFixed(1) + 's' : ''}`).join('<br>');
+      .map(c => `${esc(c.name)} — ${esc(c.artistName)} [${(c.storefronts || [c.storefront]).join(',')}]${c.durDelta != null ? ' Δ' + c.durDelta.toFixed(1) + 's' : ''}`).join('<br>');
     L.push(`| ${r.idx} | ${esc(r.name)} | ${esc(r.artist)} | ${esc(r.album)} | ${alt || '(无任何候选)'} |`);
   }
   L.push('');

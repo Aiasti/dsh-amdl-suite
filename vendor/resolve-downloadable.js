@@ -34,6 +34,8 @@ const MIN_INTERVAL = parseInt(opt('min-interval', '900'), 10);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const AUTO = new Set(['A-name', 'B-duration+album']);
+const STOREFRONT = String(opt('storefront', 'cn')).trim() || 'cn';
+const SF_LABEL = STOREFRONT === 'cn' ? '国区' : `账号区(${STOREFRONT})`;
 const results = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
 const targets = results.filter(r => r.best && (ALL || AUTO.has(r.verdict)));
 if (!targets.length) { console.error('报告里没有可下载的命中（用 --all 把 C 档也带上）'); process.exit(2); }
@@ -78,14 +80,14 @@ const searchSongs = async (sf, term) => {
   for (const r of targets) {
     const ne = { name: r.name, artist: r.artist, duration: r.duration };
     const b = r.best;
-    let cn = await byId('cn', b.id);
+    let cn = await byId(STOREFRONT, b.id);
     let how;
-    if (cn) how = '原 id 在国区，直接可用';
+    if (cn) how = `原 id 在${SF_LABEL}，直接可用`;
     else {
-      // 国区没有这个 id：按曲名+歌手在国区找同一首的另一个发行版
+      // 账号区没有这个 id：按曲名+歌手在账号区找同一首的另一个发行版
       const seen = new Map();
       for (const term of S.titleCandidates(ne.name).slice(0, 2).concat([`${S.titleCandidates(ne.name)[0]} ${S.tokens(ne.artist)[0]}`.trim()])) {
-        for (const c of await searchSongs('cn', term)) {
+        for (const c of await searchSongs(STOREFRONT, term)) {
           const at = c.attributes || {};
           const sc = S.scorePair(ne.name, ne.artist, at.name, at.artistName);
           const dur = (ne.duration && at.durationInMillis) ? Math.abs(ne.duration - at.durationInMillis / 1000) : null;
@@ -96,13 +98,14 @@ const searchSongs = async (sf, term) => {
         }
       }
       const best = [...seen.values()].sort((a, b2) => b2.score - a.score)[0];
-      if (best) { cn = best.at; how = `换成国区发行版（id ${best.id}，曲名 ${(best.sc.tScore * 100).toFixed(0)}% 歌手 ${(best.sc.aScore * 100).toFixed(0)}%${best.dur != null ? ' 时长Δ' + best.dur.toFixed(1) + 's' : ''}）`; }
-      else how = '国区目录没有这个 id，也没搜到等价发行版';
+      if (best) { cn = best.at; how = `换成${SF_LABEL}发行版（id ${best.id}，曲名 ${(best.sc.tScore * 100).toFixed(0)}% 歌手 ${(best.sc.aScore * 100).toFixed(0)}%${best.dur != null ? ' 时长Δ' + best.dur.toFixed(1) + 's' : ''}）`; }
+      else how = `${SF_LABEL}目录没有这个 id，也没搜到等价发行版`;
     }
-    const verdict = cn ? '✔ 可下' : '✖ 国区无资产';
+    const verdict = cn ? '✔ 可下' : `✖ ${SF_LABEL}无资产`;
     rows.push({ idx: r.idx, name: r.name, artist: r.artist, ne_sid: r.sid, verdict, how,
       apple: cn ? cn.name : (b.name || ''), appleArtist: cn ? cn.artistName : (b.artistName || ''),
-      sf: cn ? 'cn' : '', url: cn ? cn.url : '', origin: b.storefront || '' });
+      sf: cn ? STOREFRONT : '', url: cn ? cn.url : '',
+      origin: (Array.isArray(b.storefronts) ? b.storefronts.join(',') : '') || b.storefront || '' });
     console.log(`${String(r.idx).padStart(3)} ${verdict}  ${r.name}  →  ${cn ? cn.name : '(无)'}  ${how}`);
   }
 
@@ -121,13 +124,15 @@ const searchSongs = async (sf, term) => {
   // 汇总必须分三项数：可下 / 重复（同一 Apple id 被多首指向）/ 无资产，否则重复被算成无资产
   const noAsset = rows.filter(r => !r.url).length;
   const dupCount = rows.filter(r => r.duplicate).length;
-  const L = ['# 国区可下载性核对', '',
-    `来源：${path.basename(reportFile)}　共 ${rows.length} 首　可下 ${urls.length}　重复 ${dupCount}　国区无资产 ${noAsset}`, '',
+  const skipped = results.length - rows.length;
+  const L = ['# 可下载性核对', '',
+    `来源：${path.basename(reportFile)}　共 ${results.length} 首（参与换籍 ${rows.length}）　可下 ${urls.length}　重复 ${dupCount}　${SF_LABEL}无资产 ${noAsset}`, '',
     '| # | 网易云曲名 | 网易云歌手 | 判定 | 国区曲目 | 说明 | 原命中区 |', '|---|---|---|---|---|---|---|'];
   for (const r of rows) {
     L.push(`| ${r.idx} | ${String(r.name).replace(/\|/g, '\\|')} | ${String(r.artist).replace(/\|/g, '\\|')} | ${r.verdict} | ${String(r.apple).replace(/\|/g, '\\|')} | ${r.how} | ${r.origin} |`);
   }
-  L.push('', '> 只判断「国区有没有」，不判断是不是无损：国区只上架 AAC 的曲目也会列进来，下完请用 `verify-alac.js` 复核。');
+  L.push('', '> 只判断「有没有」，不判断是不是无损：账号区只上架 AAC 的曲目也会列进来，下完请用 `verify-alac.js` 复核。');
+  if (skipped > 0) L.push('', `> 未参与换籍 ${skipped} 首（C/D/retry），见 pl-match-report.md。`);
   fs.writeFileSync(OUT + '-cn-report.md', L.join('\n'), 'utf8');
   // 机器可读结果：后续下载按 idx 回连 pl.json / pl-report.json，不解析 md
   fs.writeFileSync(OUT + '-download-cn.json', JSON.stringify(rows, null, 1), 'utf8');

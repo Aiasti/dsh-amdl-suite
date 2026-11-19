@@ -4,7 +4,7 @@
  */
 import { readFile } from 'node:fs/promises'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { detectMode, formatQuality, runDownloads, urlsFromResolved } from '../lib/download.js'
+import { detectMode, formatDownloadSummary, runDownloads, urlsFromResolved } from '../lib/download.js'
 import { startJob } from '../lib/job.js'
 import { rootFor } from '../lib/setup.js'
 
@@ -107,18 +107,11 @@ export function registerDownloadTool(ctx, config = {}) {
               throw new Error('登录态失效（引擎 /status 的 regions 为空），请按上游文档在 QEMU 串口重新登录。'
                 + '不要删 data.img —— 里面是登录态。')
             }
-            append(
-              `下载完成：成功 ${r.ok} / AAC 降级 ${r.aac} / 已存在 ${r.exists}`
-                + ` / 账号区无资产 ${r.key500} / 失败 ${r.failed}`
-                + `（超时 ${r.timeout}，取消 ${r.cancelled}）`,
-            )
-            append(`产物目录：${r.outputDir}`)
-            // 音质复核必须报给模型：下载成功不等于真无损（design §6.5 step 7）。
-            // 同时并进返回值 —— 模型能确定拿到的只有 `result`，ring 里的行不保证送达。
-            const quality = formatQuality(r.verify)
-            if (quality !== '') append(quality)
-            const head = `下载完成：成功 ${r.ok} / AAC ${r.aac} / 已存在 ${r.exists} / 失败 ${r.failed}`
-            return quality === '' ? head : `${head}；${quality}`
+            // 模型能确定拿到的只有 result：产物目录、逐首路径、音质都必须并进返回值，
+            // 不能只 append 到 ring（2026-11-19 实测模型被迫自己去翻 output 目录）。
+            const summary = formatDownloadSummary(r)
+            append(summary)
+            return summary
           } catch (err) {
             append(`下载失败：${err?.message ?? err}`)
             throw err
