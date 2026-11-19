@@ -43,7 +43,7 @@ target = https://github.com/Aiasti/dsh-amdl-suite
 
 ```powershell
 npm pack --pack-destination dist
-# 然后 install_bundle target = <仓库>\dist\dsh-amdl-suite-1.0.1.tgz
+# 然后 install_bundle target = <仓库>\dist\dsh-amdl-suite-1.0.2.tgz
 ```
 
 > **不要用 `link:` 安装** —— link 的真实路径在 profile 之外，宿主的模块解析层覆盖不到 `@deepseek-ai/*`，插件会加载失败。也不要把 bundle 放进子目录：DSH 从仓库根读 `package.json` 的 `dsh.bundle.patch`。
@@ -175,7 +175,7 @@ To install your local build:
 
 ```powershell
 npm pack --pack-destination dist
-# then install_bundle target = <repo>\dist\dsh-amdl-suite-1.0.1.tgz
+# then install_bundle target = <repo>\dist\dsh-amdl-suite-1.0.2.tgz
 ```
 
 > Do **not** install with `link:`: the real path lives outside the profile, the host resolver cannot see `@deepseek-ai/*`, and the plugin fails to load. Do not put the bundle in a subdirectory either: DSH reads `dsh.bundle.patch` from the repository root.
@@ -274,3 +274,4 @@ Set these in the DSH plugin config (all optional):
 ## License
 
 MIT. See [LICENSE](LICENSE). The two upstream projects used at runtime are MIT too. The matching/fetch scripts under `vendor/` are original work and are licensed with this repository.
+
