@@ -10,9 +10,9 @@
     ".": "./index.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.png"
   },
-  "files": ["index.js", "cordis.patch.yml", "lib", "tools", "vendor", "locale", "icon.svg"],
+  "files": ["index.js", "cordis.patch.yml", "lib", "tools", "vendor", "locale", "icon.png"],
   "dsh": {
     "manifestVersion": 1,
     "bundle": { "patch": "./cordis.patch.yml" },
