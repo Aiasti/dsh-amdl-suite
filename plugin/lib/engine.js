@@ -28,10 +28,24 @@ function pidAlive(pid) {
   }
 }
 
-/** 读锁文件；损坏或不存在返回 `null`。 */
+/**
+ * 读锁文件。
+ *
+ * 三种结果必须分开，否则会把别人刚建好的锁搬走（双持）：
+ * - `{ missing: true }` —— 文件不在，说明刚被释放：重新抢，**绝不 rename/删**
+ * - `null` —— 存在但损坏，按遗留锁处理
+ * - 对象 —— 正常内容
+ */
 async function readLock(lockPath) {
+  let text
   try {
-    const parsed = JSON.parse(await readFile(lockPath, 'utf8'))
+    text = await readFile(lockPath, 'utf8')
+  } catch (err) {
+    if (err?.code === 'ENOENT') return { missing: true }
+    return null
+  }
+  try {
+    const parsed = JSON.parse(text)
     return parsed !== null && typeof parsed === 'object' ? parsed : null
   } catch {
     return null
@@ -54,11 +68,21 @@ export async function acquireEngineLock(lockPath, options = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       await writeFile(lockPath, JSON.stringify({ pid: process.pid, at: now() }), { flag: 'wx' })
-      return { acquired: true, release: async () => { await rm(lockPath, { force: true }) } }
+      return {
+        acquired: true,
+        release: async () => {
+          // 只删自己的锁：pid 对不上就说明已被别人接管/重建
+          const cur = await readLock(lockPath)
+          if (cur !== null && cur.missing !== true && cur.pid !== process.pid) return
+          await rm(lockPath, { force: true })
+        },
+      }
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err
 
       const holder = await readLock(lockPath)
+      // 刚被别人释放：直接回到循环重新 `wx`，不要 rename（那会搬走第三者刚建的新锁）
+      if (holder !== null && holder.missing === true) continue
       const stale = holder === null
         || !pidAlive(holder.pid)
         || now() - Number(holder.at ?? 0) > LOCK_TTL_MS
