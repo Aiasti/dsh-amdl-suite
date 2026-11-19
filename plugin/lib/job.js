@@ -7,6 +7,10 @@
  * - 正常结束时也执行（`finally`）；
  * - 只执行一次，`cancel` 多次调用也不会重复清理。
  *
+ * `done` 必须结算成 `JobOutcome`（`{status, detail?, result?}`）：注册表直接执行
+ * `job.status = outcome.status`，其余状态值都不是终态，job 会永远停在 `running`。
+ * `work` 直接返回字符串时视为"完成 + 结果"；被取消后返回则结算成 `killed`。
+ *
  * @param {object} options
  * @param {{ start(spec: object): string }} options.jobs DSH job 注册表
  * @param {string} options.owner 会话 id
@@ -46,8 +50,24 @@ export const startJob = ({ jobs, owner, toolCall, kind, label, work }) =>
         }
       }
 
+      /**
+       * `work` 的返回值 → 注册表要的 `JobOutcome`。
+       *
+       * 注册表执行 `job.status = outcome.status`（dsh-jobs-local:771），而
+       * `completed/killed/failed` 之外的任何值都不算终态 —— 直接把 `work` 的返回
+       * 对象交出去，job 会永远停在 `running`，模型也永远收不到结算通知。
+       * `result` 只收字符串：结构化结果由 `work` 自己 append 到 ring。
+       */
+      const outcomeOf = (value) => {
+        if (cancelled) return { status: 'killed' }
+        return typeof value === 'string'
+          ? { status: 'completed', result: value }
+          : { status: 'completed' }
+      }
+
       const done = Promise.resolve()
         .then(() => work({ append, isCancelled, registerCancel }))
+        .then(outcomeOf)
         .finally(() => runCancel())
 
       return {

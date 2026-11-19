@@ -54,7 +54,8 @@ export function registerMatchTool(ctx, config = {}) {
         toolCall: exec?.toolCall,
         kind: 'amdl-match',
         label: `匹配歌单 ${args.playlistUrl}`,
-        // work 自己吞掉异常：`done` 无人 await 时，reject 会变成 unhandled rejection
+        // 抛出而不是返回 {error}：注册表把 done 的 reject 结算成 `failed`，
+        // 返回对象只会得到一个显示为 `completed` 的失败 job。
         work: async ({ append, isCancelled }) => {
           try {
             const r = await runMatch({ playlistUrl: args.playlistUrl, root, config, append, isCancelled })
@@ -63,10 +64,10 @@ export function registerMatchTool(ctx, config = {}) {
                 + ` / 请求失败 ${r.retry} / 账号区无资产 ${r.accountMissing}`,
             )
             append(`产物：${r.reportPath}`)
-            return r
+            return `匹配完成：可下载 ${r.download} / 需复核 ${r.review}`
           } catch (err) {
             append(`匹配失败：${err?.message ?? err}`)
-            return { error: String(err?.message ?? err) }
+            throw err
           }
         },
       })
